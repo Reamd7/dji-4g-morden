@@ -2,10 +2,19 @@
 go = "latest"
 
 [env]
+# Isolate Go workspace: GOPATH inside the project so `go install`ed tools
+# (gopls, dlv, staticcheck) live in .gopath/bin and survive Go version bumps.
+GOPATH = "{{ config_root }}/.gopath"
+# Force `go install` into GOPATH/bin (overriding mise's GOBIN default that
+# points into the Go install dir, which gets wiped on version bumps).
+GOBIN = ""
 # Make mingw64's gcc available for CGO (e.g. SQLite drivers).
-# _.path prepends mingw64/bin to PATH, and CC pins the exact gcc so it wins
-# over any other gcc that the parent shell (e.g. git bash) may inject.
-_.path = ["C:\\msys64\\mingw64\\bin"]
+# _.path order matters: put .gopath/bin first so `gopls` etc. resolve before
+# anything the parent shell injects; then mingw64/bin for gcc.
+_.path = [
+    "{{ config_root }}/.gopath/bin",
+    "C:\\msys64\\mingw64\\bin",
+]
 CC = "C:\\msys64\\mingw64\\bin\\gcc.exe"
 # Let cgo's pkg-config find mingw64 libraries (libusb-1.0, etc.)
 PKG_CONFIG_PATH = "C:\\msys64\\mingw64\\lib\\pkgconfig"

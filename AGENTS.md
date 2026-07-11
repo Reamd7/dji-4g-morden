@@ -68,7 +68,16 @@
 go = "latest"
 
 [env]
-_.path = ["C:\\msys64\\mingw64\\bin"]
+GOPATH = "{{ config_root }}/.gopath"
+# Force `go install` into GOPATH/bin (overriding mise's GOBIN default that
+# points into the Go install dir, which gets wiped on version bumps).
+GOBIN = ""
+# _.path order matters: .gopath/bin first (so gopls/dlv/staticcheck resolve
+# before anything the parent shell injects), then mingw64/bin for gcc.
+_.path = [
+    "{{ config_root }}/.gopath/bin",
+    "C:\\msys64\\mingw64\\bin",
+]
 CC = "C:\\msys64\\mingw64\\bin\\gcc.exe"
 PKG_CONFIG_PATH = "C:\\msys64\\mingw64\\lib\\pkgconfig"
 ```
@@ -88,6 +97,50 @@ PKG_CONFIG_PATH = "C:\\msys64\\mingw64\\lib\\pkgconfig"
   - gousb 是 cgo 绑定 libusb,编译时 `pkg-config --cflags --libs libusb-1.0` 必须能找到。
   - **`PKG_CONFIG_PATH` 必须显式设为 `C:\msys64\mingw64\lib\pkgconfig`**,否则 cgo 报 `pkg-config: executable file not found` 或找不到 libusb。
   - libusb-1.0.dll 运行时需要在 PATH 里(mingw64/bin 已通过 `_.path` 加入)。
+
+### Go LSP 工具链
+
+通过 `go install` 装入项目内 `GOPATH/bin`(即 `.gopath/bin/`),不入库(`.gitignore` 已忽略 `/.gopath/`)。
+
+| 工具 | 版本(2026-07-11) | 用途 |
+|---|---|---|
+| **gopls** | v0.23.0 | Go 官方 LSP server(代码补全/跳转/诊断) |
+| **dlv** (Delve) | v1.27.0 | 调试器(DAP 协议) |
+| **staticcheck** | 2026.1 (v0.7.0) | 静态分析 |
+
+安装命令(均需 `mise exec` 环境下执行):
+```bash
+mise exec -- go install golang.org/x/tools/gopls@latest
+mise exec -- go install github.com/go-delve/delve/cmd/dlv@latest
+mise exec -- go install honnef.co/go/tools/cmd/staticcheck@latest
+```
+
+**踩坑 — `GOBIN` 必须显式清空**:
+mise 的 Go 包默认把 `GOBIN` 指向 mise 的 Go 安装目录(`…/mise/installs/go/<ver>/bin`)。`go install` 时 `GOBIN` 优先级高于 `GOPATH/bin`,导致工具被装进 Go 安装目录——升级 Go 版本时会被清空。`.mise.toml` 中 `GOBIN = ""` 强制落回 `GOPATH/bin`(即项目内 `.gopath/bin/`)。
+
+**踩坑 — GOPATH 隔离**:
+`GOPATH` 设为 `{{ config_root }}/.gopath`(项目内),工具不污染全局 `~/go`。`.gopath/bin` 已通过 `_.path` 加入 PATH,shell 和编辑器都能直接调用 `gopls.exe` / `dlv.exe` / `staticcheck.exe`。
+
+### 编辑器 LSP 接入
+
+编辑器(VSCode/ZCode 等)的 Go 插件需要知道 Go/gopls 的位置。GOROOT/GOPATH 由 mise 动态给出:
+```bash
+mise exec -- go env GOROOT GOPATH
+```
+
+**方式 A(推荐)— 让编辑器继承 mise 环境**:从已激活 mise 的终端启动编辑器(如 `mise exec -- code .`),或用 mise 的 shell hook。编辑器的 Go 插件会自动用 PATH 里的 `gopls`。
+
+**方式 B(手动)— 在 settings.json 指定**:
+```jsonc
+{
+  // VSCode / ZCode settings.json
+  "go.goroot": "<mise exec -- go env GOROOT 的输出>",
+  "go.gopath": "C:\\Users\\reamd\\Documents\\experiment_area\\vohive-release\\dji-modem-research\\.gopath",
+  "go.useLanguageServer": true,
+  "go.toolsManagement.autoUpdate": false  // 工具由 mise 管,别让插件自己装
+}
+```
+> 注意设 `go.toolsManagement.autoUpdate: false`,否则 Go 插件会把工具又装回全局 `~/go`,与 mise 管理的版本冲突。
 
 ## Go 项目结构(当前)
 

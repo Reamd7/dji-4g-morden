@@ -1,5 +1,18 @@
 # Compiled binaries
 *.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
 
 # Plan files (editor scratch)
 .zcode/
+
+# Project-local GOPATH (mise-installed tools: gopls, dlv, staticcheck)
+/.gopath/
+
+# Go workspace files (local only)
+/go.work
+/go.work.sum
