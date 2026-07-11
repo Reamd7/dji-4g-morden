@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# pre-commit hook: run go tests before allowing a commit.
+#
+# This hook is version-controlled under .githooks/ and activated via
+# `git config core.hooksPath .githooks`. To install for this repo:
+#
+#   git config core.hooksPath .githooks
+#
+# Tests are scoped to ./internal/... — cmd/ are cgo (gousb) hardware tools and
+# are not unit-tested (see AGENTS.md "测试分层"). The test environment mirrors
+# what Makefile sets up, so this hook works independently of `make`.
+
+set -euo pipefail
+
+# Resolve toolchain via mise (same approach as Makefile: mise exec does not work
+# in non-interactive shells on Windows, but `mise where` does).
+GOROOT="$(mise where go 2>/dev/null || true)"
+if [ -z "$GOROOT" ]; then
+  echo "pre-commit: mise/go not found — skipping tests (install mise + run 'mise install')" >&2
+  exit 0
+fi
+GO="$GOROOT/bin/go"
+
+# Project-local GOPATH + Windows env vars that go.exe needs (mirrors Makefile).
+# USERPROFILE is always set on Windows (git-bash inherits it); fall back to $HOME.
+ROOT="$(git rev-parse --show-toplevel)"
+export GOPATH="$ROOT/.gopath"
+export GOBIN=""
+USER_HOME="${USERPROFILE:-$HOME}"
+# Convert /c/Users/... to C:\Users\... so go.exe (a Windows binary) accepts it.
+WIN_HOME="$(echo "$USER_HOME" | sed 's|^/\([a-zA-Z]\)/|\1:\\|; s|/|\\|g')"
+export LocalAppData="${LocalAppData:-${WIN_HOME}\\AppData\\Local}"
+export APPDATA="${APPDATA:-${WIN_HOME}\\AppData\\Roaming}"
+export TMP="${TMP:-${WIN_HOME}\\AppData\\Local\\Temp}"
+export TEMP="${TEMP:-${WIN_HOME}\\AppData\\Local\\Temp}"
+export GOTMPDIR="${GOTMPDIR:-${WIN_HOME}\\AppData\\Local\\Temp}"
+export CC="C:\\msys64\\mingw64\\bin\\gcc.exe"
+export PKG_CONFIG_PATH="C:\\msys64\\mingw64\\lib\\pkgconfig"
+export PATH="$GOPATH/bin:/c/msys64/mingw64/bin:$PATH"
+
+echo "pre-commit: running go test ./internal/... (race detector on)"
+# -race is mandatory for transport/concurrency code per AGENTS.md testing policy.
+if ! "$GO" test -race ./internal/...; then
+  echo "" >&2
+  echo "pre-commit: TESTS FAILED — commit aborted." >&2
+  echo "Run 'make test-race' to debug, or bypass with 'git commit --no-verify' (not recommended)." >&2
+  exit 1
+fi
+
+echo "pre-commit: tests passed ✓"
+exit 0
