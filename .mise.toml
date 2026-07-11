@@ -1,0 +1,9 @@
+[tools]
+go = "latest"
+
+[env]
+# Make mingw64's gcc available for CGO (e.g. SQLite drivers).
+# _.path prepends mingw64/bin to PATH, and CC pins the exact gcc so it wins
+# over any other gcc that the parent shell (e.g. git bash) may inject.
+_.path = ["C:\\msys64\\mingw64\\bin"]
+CC = "C:\\msys64\\mingw64\\bin\\gcc.exe"
