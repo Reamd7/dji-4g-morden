@@ -47,6 +47,12 @@
 
 **AT 通路已打通**(`cmd/attest/`):通过 gousb claim MI_02 → EP 0x03 OUT 发 `AT\r\n` → EP 0x84 IN 收到 `AT\r` 回显 + `\r\nOK\r\n`。证明整条链路 gousb → libusb → WinUSB → USB bulk → 模块 AT 口工作正常。阶段 1 物理基础 OK。
 
+**端到端里程碑达成(2026-07-12)**:`internal/usbtransport/` + `third_party/sms-gateway/modem/` 接入完成,hardware 测试 `TestHardwareModemInitializeAndCSQ` 通过。完整 AT 会话验证:
+- `Initialize` 成功:AT → ATE0 → AT+CMEE=1 → AT+CPIN?(`+CPIN: READY`)→ AT+CMGF=0 → AT+CNMI=2,1 → AT+CPMS="SM"(`+CPMS: 3,50`)
+- `SendAndWait("AT+CSQ")` 返回 `+CSQ: 26,99`(RSSI=26)
+- 证明 USB transport 能驱动完整的 sms_gateway/modem AT 协议层(初始化 + URC 订阅 + 短信存储就绪)
+- **阶段 1 核心目标达成**:纯用户态 USB → AT 协议层链路打通,无需任何厂商驱动
+
 ### 目录结构
 
 - `docs/` —— 调研报告(中文 markdown)
@@ -248,17 +254,36 @@ dji-modem-research/
 ├── .mise.toml       # mise 工具链配置
 ├── .githooks/       # pre-commit hook(强制 go test -race 通过)
 ├── Makefile         # 标准化 test/cover/lint 等命令
-├── go.mod           # module dji-modem-research,依赖 gousb
+├── go.mod           # module dji-modem-research,依赖 gousb/zerolog/serial
 ├── main.go          # hello world
 ├── internal/
 │   ├── usbdesc/     # USB 描述符格式化(纯逻辑,从 usbprobe 抽出,100% 覆盖)
-│   └── testutil/    # ScriptPort mock io.ReadWriteCloser(供 transport 测试)
+│   ├── testutil/    # ScriptPort mock io.ReadWriteCloser(供 transport 测试)
+│   └── usbtransport/# ATTransport:USB bulk endpoint → io.ReadWriteCloser
+│       ├── usbtransport.go             # Open/Read(200ms 短轮询)/Write/Close
+│       ├── usbtransport_test.go        # mock 单测(ScriptPort + modem NewFromIO 集成)
+│       └── usbtransport_hardware_test.go # 真实 EC25 集成测试(build tag: hardware)
+├── third_party/
+│   └── sms-gateway/ # 从 sms_gateway 复制的 AT 协议层(AGPL-3.0)
+│       ├── LICENSE
+│       └── modem/   # modem.go(+NewFromIO+port接口化) + sms.go + pdu.go
 ├── cmd/
 │   ├── usbprobe/    # USB 接口/endpoint 枚举探针(硬件,go run)
 │   └── attest/      # MI_02 AT 通路验证(硬件,go run)
 └── docs/            # 研究文档
 ```
 
-- `go.mod` 模块名:`dji-modem-research`,依赖 `github.com/google/gousb`
+- `go.mod` 模块名:`dji-modem-research`
+- 依赖:`github.com/google/gousb`(USB)、`github.com/rs/zerolog` + `go.bug.st/serial`(modem 包保留)
 - 运行探针:`mise exec -- go run ./cmd/usbprobe/`
 - 运行 AT 测试:`mise exec -- go run ./cmd/attest/`
+- 跑 mock 单测:`make test-race`
+- 跑硬件集成测试(需 EC25 + WinUSB):`make test-hardware`
+
+### third_party 复制方案(非 replace)
+
+`sms-gateway/modem/` 从 `source/sms_gateway/agent/internal/modem/` **复制**(非 go.mod replace),理由:
+- 可移植(无绝对路径依赖,换机器/CI 不断)
+- 改动最小:仅 `port serial.Port` → `port io.ReadWriteCloser` + 加 `NewFromIO` 构造函数,其余原样保留(含 ICMP ping / zerolog / Open 串口路径)
+- AGPL-3.0 LICENSE 随复制,合规
+- 选型依据见 `docs/07`(标准符合度对比,选 sms_gateway 而非 vohive/uicc-go)

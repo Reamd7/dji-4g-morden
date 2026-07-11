@@ -86,6 +86,17 @@ func (p *ScriptPort) Close() error {
 	return nil
 }
 
+// Feed appends bytes to the readable buffer as if the device sent them
+// asynchronously (e.g. an AT response or a URC). Unlike Write, which records
+// host-to-device bytes, Feed makes bytes available to subsequent Read calls.
+// Wakes any blocked reader so the new data is observed promptly.
+func (p *ScriptPort) Feed(data []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.readData = append(p.readData, data...)
+	p.cond.Broadcast()
+}
+
 // Written returns a copy of all bytes written to the port so far.
 func (p *ScriptPort) Written() []byte {
 	p.mu.Lock()
