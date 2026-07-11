@@ -50,3 +50,7 @@ Windows 短信工具（`send_sms.js` / `read_sms.js`）+ Quectel 驱动安装包
 | `01-userland-usb-modem-feasibility.md` | 不装驱动的用户态 USB modem 方案可行性研究 |
 | `02-dji-modem-hardware-and-flashing.md` | DJI 模块硬件分析与刷写研究 |
 | `03-source-code-analysis.md` | 源码深度分析（协议栈复用性 + 跨平台评估） |
+| `04-at-command-standards.md` | uicc-go `at/` 包 AT 命令电信标准规范索引（TS 27.007/27.005、V.250、7816-4 等） |
+| `05-sms-gateway-modem-analysis.md` | sms_gateway/modem 包实现剖析（AT 通道 + PDU 编解码 + transport 改造点 + 复用评估） |
+| `06-vohive-modem-analysis.md` | vohive/modem Manager + smscodec 包实现剖析（AT 通道 + PDU + URC + 复用评估） |
+| `07-at-implementation-comparison.md` | 两个 AT 实现的电信标准符合度逐维度对比 + 选型建议 |
