@@ -321,9 +321,16 @@ Wintun DLL 用于创建虚拟网卡。不需要安装，随程序分发。
 
 ## 八、风险和不确定性
 
-### 8.1 USB endpoint 地址的确认
+### 8.1 USB endpoint 地址的确认 ✅ 已解除(2026-07-11)
 
-需要用 `lsusb -v` 或 libusb 枚举确认 Iface 2 和 Iface 4 的具体 endpoint 地址。RESEARCH_NOTES 给出的是 DJI 私有模式下的地址（Iface 3），EC25 模式下可能不同。
+实测确认(`cmd/usbprobe/main.go`)。EC25 模式(PID 0125)下 Iface 2 和 Iface 4 的 endpoint 地址:
+
+- **Iface 2(AT 命令口)**:EP 0x03 OUT bulk / EP 0x84 IN bulk / EP 0x85 IN intr
+- **Iface 4(QMI 数据通道)**:EP 0x05 OUT bulk / EP 0x88 IN bulk / EP 0x89 IN intr
+
+完整 5 接口布局见 AGENTS.md「实测验证结果」。规律:OUT 端点递增 0x01~0x05,IN 端点递增 0x81~0x89。
+
+AT 通路已端到端验证(`cmd/attest/main.go`):通过 gousb claim Iface 2 → EP 0x03 发 `AT\r\n` → EP 0x84 收到回显 + `\r\nOK\r\n`。gousb → libusb → WinUSB → 模块链路正常。
 
 ### 8.2 QMI 数据格式
 

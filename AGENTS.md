@@ -31,6 +31,22 @@
 - 阶段 2:QMI 通道 + 拨号(中等,~150 行)
 - 阶段 3:TUN 虚拟网卡 + 上网(最难,~250 行)
 
+### 实测验证结果(2026-07-11)
+
+**USB endpoint 地址实测确认**(解除 `docs/01` §8.1 的未知风险)。DJI 百望 EC25 模式(PID 0125)布局:
+
+| 接口 | 用途 | Endpoints |
+|---|---|---|
+| MI_00 | DM 诊断口 | EP 0x01 OUT bulk / EP 0x81 IN bulk |
+| MI_01 | NMEA GPS | EP 0x02 OUT / EP 0x82 IN bulk / EP 0x83 IN intr(10B) |
+| **MI_02** | **AT 命令口** | **EP 0x03 OUT bulk / EP 0x84 IN bulk / EP 0x85 IN intr(10B)** |
+| MI_03 | Modem 控制 | EP 0x04 OUT / EP 0x86 IN bulk / EP 0x87 IN intr(10B) |
+| **MI_04** | **QMI 数据通道** | **EP 0x05 OUT bulk / EP 0x88 IN bulk / EP 0x89 IN intr(8B)** |
+
+规律:OUT 端点递增 0x01~0x05,IN 端点递增 0x81~0x89。MI_04 的 interrupt 端点 maxPacket=8(QMI URC 通知),其他接口的 interrupt maxPacket=10。
+
+**AT 通路已打通**(`cmd/attest/`):通过 gousb claim MI_02 → EP 0x03 OUT 发 `AT\r\n` → EP 0x84 IN 收到 `AT\r` 回显 + `\r\nOK\r\n`。证明整条链路 gousb → libusb → WinUSB → USB bulk → 模块 AT 口工作正常。阶段 1 物理基础 OK。
+
 ### 目录结构
 
 - `docs/` —— 调研报告(中文 markdown)
@@ -54,6 +70,7 @@ go = "latest"
 [env]
 _.path = ["C:\\msys64\\mingw64\\bin"]
 CC = "C:\\msys64\\mingw64\\bin\\gcc.exe"
+PKG_CONFIG_PATH = "C:\\msys64\\mingw64\\lib\\pkgconfig"
 ```
 
 ### 关键约定 / 踩坑记录
@@ -66,6 +83,11 @@ CC = "C:\\msys64\\mingw64\\bin\\gcc.exe"
   - **`CC` 必须显式锁定为绝对路径**:git bash 会把 MSYS2 的 `/c/msys64/usr/bin/gcc`(15.2.0)注入 PATH 且排在 `_.path` 前面,导致 `which gcc` 命中的是错的那个。设置 `CC` 后 CGO 编译器确定,不受 PATH 顺序干扰。
   - `CGO_ENABLED=1` 默认开启。
   - 已用最小 CGO 程序验证通过。
+- **libusb-1.0 + pkg-config**(gousb USB 通信必需):
+  - 通过 `pacman -S mingw-w64-x86_64-libusb mingw-w64-x86_64-pkg-config` 安装(MSYS2)。
+  - gousb 是 cgo 绑定 libusb,编译时 `pkg-config --cflags --libs libusb-1.0` 必须能找到。
+  - **`PKG_CONFIG_PATH` 必须显式设为 `C:\msys64\mingw64\lib\pkgconfig`**,否则 cgo 报 `pkg-config: executable file not found` 或找不到 libusb。
+  - libusb-1.0.dll 运行时需要在 PATH 里(mingw64/bin 已通过 `_.path` 加入)。
 
 ## Go 项目结构(当前)
 
@@ -75,9 +97,12 @@ dji-modem-research/
 ├── .mise.toml       # mise 工具链配置
 ├── go.mod           # module dji-modem-research
 ├── main.go          # hello world
+├── cmd/
+│   ├── usbprobe/    # USB 接口/endpoint 枚举探针
+│   └── attest/      # MI_02 AT 通路验证(发 AT 收 OK)
 └── docs/            # 研究文档
 ```
 
-- `go.mod` 模块名:`dji-modem-research`
-- `main.go`:`fmt.Println("Hello, World!")`
-- 运行:`mise exec -- go run main.go` → `Hello, World!`
+- `go.mod` 模块名:`dji-modem-research`,依赖 `github.com/google/gousb`
+- 运行探针:`mise exec -- go run ./cmd/usbprobe/`
+- 运行 AT 测试:`mise exec -- go run ./cmd/attest/`

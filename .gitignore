@@ -1,0 +1,5 @@
+# Compiled binaries
+*.exe
+
+# Plan files (editor scratch)
+.zcode/

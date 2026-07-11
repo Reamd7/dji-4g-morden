@@ -7,3 +7,5 @@ go = "latest"
 # over any other gcc that the parent shell (e.g. git bash) may inject.
 _.path = ["C:\\msys64\\mingw64\\bin"]
 CC = "C:\\msys64\\mingw64\\bin\\gcc.exe"
+# Let cgo's pkg-config find mingw64 libraries (libusb-1.0, etc.)
+PKG_CONFIG_PATH = "C:\\msys64\\mingw64\\lib\\pkgconfig"
