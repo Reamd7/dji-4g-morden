@@ -231,17 +231,31 @@ mise exec -- go test -race ./...
 | 业务编排 | ≥ 70% | 用 mock,重点测重连/事件分发/错误恢复 |
 | USB 物理层 | 不计 | 靠硬件集成测试,不追求覆盖率 |
 
+### Pre-commit Hook(强制 go test)
+
+`.githooks/pre-commit` 在每次 `git commit` 前自动跑 `go test -race ./internal/...`,失败则中止提交。
+
+- **激活方式**:`git config core.hooksPath .githooks`(已对本仓库执行;新克隆后需手动执行一次)
+- **绕过**:`git commit --no-verify`(不推荐)
+- Hook 内部镜像 Makefile 的环境设置:`mise where go` 解析 GOROOT,从 `USERPROFILE` 推导 Windows env(go.exe 需要)
+- race 检测对并发代码硬性要求,所以 hook 总是用 `-race`
+
 ## Go 项目结构(当前)
 
 ```
 dji-modem-research/
 ├── AGENTS.md        # 本文件
 ├── .mise.toml       # mise 工具链配置
-├── go.mod           # module dji-modem-research
+├── .githooks/       # pre-commit hook(强制 go test -race 通过)
+├── Makefile         # 标准化 test/cover/lint 等命令
+├── go.mod           # module dji-modem-research,依赖 gousb
 ├── main.go          # hello world
+├── internal/
+│   ├── usbdesc/     # USB 描述符格式化(纯逻辑,从 usbprobe 抽出,100% 覆盖)
+│   └── testutil/    # ScriptPort mock io.ReadWriteCloser(供 transport 测试)
 ├── cmd/
-│   ├── usbprobe/    # USB 接口/endpoint 枚举探针
-│   └── attest/      # MI_02 AT 通路验证(发 AT 收 OK)
+│   ├── usbprobe/    # USB 接口/endpoint 枚举探针(硬件,go run)
+│   └── attest/      # MI_02 AT 通路验证(硬件,go run)
 └── docs/            # 研究文档
 ```
 
