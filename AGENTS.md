@@ -53,6 +53,12 @@
 - 证明 USB transport 能驱动完整的 sms_gateway/modem AT 协议层(初始化 + URC 订阅 + 短信存储就绪)
 - **阶段 1 核心目标达成**:纯用户态 USB → AT 协议层链路打通,无需任何厂商驱动
 
+**短信收发验证完成(2026-07-12)**:`sms_hardware_test.go` 全套通过(hardware tag):
+- 设备信息:ICCID `89000000000000000000` / IMEI `860000000000000` / 运营商 `Carrier` / 本机号 `+8613800000000` / 信号 `-61 dBm`
+- 短信接收:`ListStored` + `DecodeDeliver` 读出 SIM 已存的 3 条中文短信(UCS-2 自动解码),发件人/正文/时间戳完整
+- **短信发送**:`Send` 完整 CMGS 两步握手(`AT+CMGS=N` → 等 `>` → PDU+Ctrl-Z → OK)成功发出短信到 `+8613800000001`
+- **readLine 修正**(上游 sms_gateway 在 USB 场景的 bug):`>` 提示符以空格结尾非 `\n`,传统串口靠短读部分返回能工作,USB CDC-AT bulk endpoint 上 `ReadString('\n')` 会把 `>` 永久卡在 bufio 缓冲区。修正:`readLine` 在部分读(无 `\n`)时,若 TrimSpace 后内容是 `>`,当一行返回。这是 USB transport 方案相对串口的必要适配。
+
 ### 目录结构
 
 - `docs/` —— 调研报告(中文 markdown)

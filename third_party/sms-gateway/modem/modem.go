@@ -662,6 +662,22 @@ func isTimeout(err error) bool {
 
 // readLine reads up to '\n' from r. Differs from bufio.Reader.ReadString in
 // that a partial-read timeout returns whatever is buffered without erroring.
+//
+// Special case for the CMGS ">" prompt: that prompt is terminated by a space,
+// not '\n', so ReadString('\n') would leave it stuck in the buffer forever on
+// a USB CDC-AT endpoint (where bytes only arrive when the modem sends them).
+// When a partial read (no '\n' yet) yields exactly ">" after trimming, return
+// it as a complete line so the caller's `line == ">"` branch fires.
 func readLine(r *bufio.Reader) (string, error) {
-	return r.ReadString('\n')
+	line, err := r.ReadString('\n')
+	if err == nil {
+		return line, nil
+	}
+	// Partial read (timeout / no '\n'). If the buffered content is the CMGS
+	// prompt, surface it as a line; otherwise return as-is so callers can
+	// treat it as a nothing-to-do timeout.
+	if strings.TrimSpace(line) == ">" {
+		return line, nil
+	}
+	return line, err
 }
