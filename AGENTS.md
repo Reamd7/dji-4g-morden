@@ -142,6 +142,95 @@ mise exec -- go env GOROOT GOPATH
 ```
 > 注意设 `go.toolsManagement.autoUpdate: false`,否则 Go 插件会把工具又装回全局 `~/go`,与 mise 管理的版本冲突。
 
+## 测试方案
+
+### 测试约定(与上游 vohive-collection 对齐)
+
+本项目继承上游 `quectel-qmi-go` / `uicc-go` 的测试风格,保证代码风格统一:
+
+- **只用标准库 `testing`** —— 不引入 testify(上游 39 个测试文件 0 个用 testify)。断言用手写 `if got != want { t.Errorf(...) }`。
+- **手写 mock,不用 mock 框架** —— 参考 `uicc-go/at/at_test.go` 的 `scriptPort` 模式(实现 `io.ReadWriteCloser`,内置预设响应脚本)。
+- **table-driven 风格** —— 多用例用 `[]struct{ name string; ... }` 切片 + `t.Run(tc.name, ...)`。
+- **测试文件与被测代码同包同目录** —— `foo.go` ↔ `foo_test.go`,包名相同(非 `foo_test`),便于访问未导出符号。
+
+### 测试分层(按可测性 / 是否依赖硬件)
+
+本项目代码必须按"是否需要真实 USB 硬件"严格分层,这是可测试性的核心:
+
+| 层 | 依赖硬件? | 测试方式 | 示例 |
+|---|---|---|---|
+| **协议层**(QMI/AT/SMS PDU 编解码) | ❌ 纯计算 | 内存单测,输入 bytes → 断言解析结果 | QMUX 帧编解码、AT+CMGS PDU 编码、GSM7/UCS2 转换 |
+| **Transport 接口适配层** | ❌ 用 mock | mock `io.ReadWriteCloser` / `qmiTransport` | USB endpoint 包装器、帧分片重组、超时处理 |
+| **USB 物理层**(gousb/libusb 调用) | ✅ 需硬件 | 集成测试,**用 build tag 隔离** | `attest`、`usbprobe`、真实收发 |
+| **上层业务**(拨号/短信收发编排) | ❌ 用 mock | 注入 mock transport,验证状态机/重连/事件分发 | 自动拨号重连、短信事件回调 |
+
+**关键设计原则:USB 操作必须被接口包裹,绝不散落到业务代码里。** 这样 80% 的逻辑(协议栈、业务编排)可以完全离线、CI 里跑,只有最薄一层 USB 物理调用需要硬件验证。
+
+### Build tag 隔离硬件测试
+
+需要真实设备的测试/命令用 build tag `//go:build hardware` 标记,**不参与默认 `go test ./...`**,避免无设备环境跑红:
+
+```go
+//go:build hardware
+
+package usbtransport
+
+// 这里的测试需要插着 EC25 模块 + WinUSB 驱动,否则跳过或失败。
+```
+
+- 默认(CI、无硬件):`go test ./...` —— 只跑纯逻辑 + mock 测试
+- 有硬件时:`go test -tags=hardware ./...` —— 额外跑设备集成测试
+- `cmd/` 下的 `usbprobe` / `attest` 本身就是硬件验证工具,不在 `go test` 范围(是 `go run`)
+
+### Transport 可测性的接口设计
+
+`docs/01` 已确认两个核心上游接口(本项目要实现 USB 版本):
+
+```go
+// quectel-qmi-go 的 transport 接口(pkg/qmi/transport.go)
+type qmiTransport interface {
+    Read([]byte) (int, error)
+    Write([]byte) (int, error)
+    Close() error
+    SetReadDeadline(time.Time) error
+}
+
+// uicc-go 的 AT 接口(at/at.go)
+// Reader.port 字段类型是 io.ReadWriteCloser
+```
+
+本项目 USB transport 实现这两个接口后,**测试时注入内存版 mock 即可**,无需真实 USB。mock 直接复用上游 `scriptPort` 思路(预设响应队列 + 记录写入)。
+
+### 跑测试的命令(均在 mise exec 下)
+
+```bash
+# 默认:纯逻辑 + mock 测试(CI 友好,无需硬件)
+mise exec -- go test ./...
+
+# 带硬件:额外跑设备集成测试(需 EC25 + WinUSB)
+mise exec -- go test -tags=hardware ./...
+
+# 详细输出 + 覆盖率
+mise exec -- go test -v -cover ./...
+
+# 单个包
+mise exec -- go test -v ./internal/usbtransport/
+
+# 竞态检测(transport/并发代码必跑)
+mise exec -- go test -race ./...
+```
+
+> **`-race` 是硬性要求**:transport 层有并发读写(Read goroutine + Write 主循环),所有 transport/manager 相关测试必须通过 `-race`。
+
+### 覆盖率目标
+
+| 层 | 目标 | 说明 |
+|---|---|---|
+| 协议编解码 | ≥ 90% | 纯函数,边界用例必须覆盖 |
+| Transport 适配层 | ≥ 80% | 用 mock,需覆盖分片/超时/错误路径 |
+| 业务编排 | ≥ 70% | 用 mock,重点测重连/事件分发/错误恢复 |
+| USB 物理层 | 不计 | 靠硬件集成测试,不追求覆盖率 |
+
 ## Go 项目结构(当前)
 
 ```
