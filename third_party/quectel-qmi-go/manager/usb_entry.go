@@ -31,3 +31,25 @@ func NewWithClient(cfg Config, logger Logger, client *qmi.Client) *Manager {
 	}
 	return m
 }
+
+// SettingsV6 returns the IPv6 runtime settings, or nil if IPv6 is not
+// connected. Call after Connect() with EnableIPv6: true.
+func (m *Manager) SettingsV6() *qmi.RuntimeSettings {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.settingsV6
+}
+
+// HandleV6 returns the IPv6 packet data handle (non-zero if IPv6 connected).
+func (m *Manager) HandleV6() uint32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.handleV6
+}
+
+// HandleV4 returns the IPv4 packet data handle (non-zero if IPv4 connected).
+func (m *Manager) HandleV4() uint32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.handleV4
+}

@@ -167,6 +167,7 @@ type Manager struct {
 	mu                sync.RWMutex
 	state             State
 	settings          *qmi.RuntimeSettings
+	settingsV6        *qmi.RuntimeSettings // IPv6 runtime settings (nil if IPv6 not connected)
 	controlReady      bool
 	controlReadyStage string
 	controlReadySince time.Time
@@ -3505,6 +3506,9 @@ func (m *Manager) configureNetwork() error {
 		ctx, cancel := m.opContext(m.cfg.Timeouts.StatusCheck)
 		settingsV6, err := m.wdsV6.GetRuntimeSettings(ctx, qmi.IpFamilyV6)
 		cancel()
+		m.mu.Lock()
+		m.settingsV6 = settingsV6
+		m.mu.Unlock()
 		if err != nil {
 			m.log.WithError(err).Warn("Failed to get IPv6 settings")
 		} else {

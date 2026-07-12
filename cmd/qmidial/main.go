@@ -68,6 +68,7 @@ func main() {
 	cfg := manager.Config{
 		APN:        *apn,
 		EnableIPv4: true,
+		EnableIPv6: true,
 		Timeouts: manager.TimeoutConfig{
 			IndicationRegister: 15 * time.Second,
 			Init:               30 * time.Second,
@@ -101,7 +102,7 @@ func main() {
 	}
 
 	// 6. Dialup (WDS StartNetwork — activates data connection)
-	fmt.Printf("[6/6] Dialing (WDS StartNetwork, APN=%s)...\n", *apn)
+	fmt.Printf("[6/6] Dialing (WDS StartNetwork, APN=%s, IPv4+IPv6)...\n", *apn)
 	if err := mgr.Connect(); err != nil {
 		fmt.Fprintf(os.Stderr, "Connect failed: %v\n", err)
 		os.Exit(1)
@@ -150,26 +151,45 @@ func printDeviceInfo(mgr *manager.Manager) {
 }
 
 func printConnectionInfo(mgr *manager.Manager) {
+	// IPv4
 	s := mgr.Settings()
-	if s == nil {
-		fmt.Println("      (no runtime settings available)")
-		return
-	}
-	if len(s.IPv4Address) > 0 {
-		ones, _ := s.IPv4Subnet.Size()
-		fmt.Printf("      IPv4:     %s/%d\n", s.IPv4Address, ones)
-	}
-	if len(s.IPv4Gateway) > 0 {
-		fmt.Printf("      Gateway:  %s\n", s.IPv4Gateway)
-	}
-	if len(s.IPv4DNS1) > 0 {
-		fmt.Printf("      DNS:      %s", s.IPv4DNS1)
-		if len(s.IPv4DNS2) > 0 {
-			fmt.Printf(", %s", s.IPv4DNS2)
+	if s != nil {
+		if len(s.IPv4Address) > 0 {
+			ones, _ := s.IPv4Subnet.Size()
+			fmt.Printf("      IPv4:     %s/%d\n", s.IPv4Address, ones)
 		}
-		fmt.Println()
+		if len(s.IPv4Gateway) > 0 {
+			fmt.Printf("      Gateway:  %s\n", s.IPv4Gateway)
+		}
+		if len(s.IPv4DNS1) > 0 {
+			fmt.Printf("      DNS:      %s", s.IPv4DNS1)
+			if len(s.IPv4DNS2) > 0 {
+				fmt.Printf(", %s", s.IPv4DNS2)
+			}
+			fmt.Println()
+		}
+		if s.MTU > 0 {
+			fmt.Printf("      MTU:      %d\n", s.MTU)
+		}
 	}
-	if s.MTU > 0 {
-		fmt.Printf("      MTU:      %d\n", s.MTU)
+
+	// IPv6
+	s6 := mgr.SettingsV6()
+	if s6 != nil && len(s6.IPv6Address) > 0 {
+		fmt.Printf("      IPv6:     %s/%d\n", s6.IPv6Address, s6.IPv6Prefix)
+		if len(s6.IPv6Gateway) > 0 {
+			fmt.Printf("      GW v6:    %s\n", s6.IPv6Gateway)
+		}
+		if len(s6.IPv6DNS1) > 0 {
+			fmt.Printf("      DNSv6:   %s", s6.IPv6DNS1)
+			if len(s6.IPv6DNS2) > 0 {
+				fmt.Printf(", %s", s6.IPv6DNS2)
+			}
+			fmt.Println()
+		}
+	} else if mgr.HandleV6() != 0 {
+		fmt.Println("      IPv6:     (connected but no address)")
+	} else {
+		fmt.Println("      IPv6:     (not connected)")
 	}
 }
