@@ -72,17 +72,26 @@ settings, err := wds.GetRuntimeSettings(ctx, qmi.IpFamilyV4)
 
 ## 交付物 / 完成标志
 
-- [ ] `NewClientFromTransport` 成功(SyncOnOpen 通过,模组响应 CTL Sync)
-- [ ] `NewWDAService` + `SetDataFormat(LinkProtocolIP)` 成功
-- [ ] `NewWDSService` + `StartNetworkInterface` 返回非零 PDH
-- [ ] `GetRuntimeSettings` 返回有效 IPv4 + DNS + MTU
-- [ ] 拨号期间无 segfault(子计划 03 的并发安全生效)
+- [x] `NewClientFromTransport` 成功(SyncOnOpen 通过,模组响应 CTL SYNC) — qmidial 验证
+- [x] WDA `SetDataFormat(LinkProtocolIP)` 成功 — manager.StartCore 内部分配 WDA 并配置
+- [x] WDS `StartNetworkInterface` 返回非零 PDH — manager.Connect 内部完成
+- [x] `GetRuntimeSettings` 返回有效 IPv4 + IPv6 + DNS + MTU — 双栈验证通过
+- [x] 拨号期间无 segfault(子计划 03 的 ioMu 并发安全生效) — 5s 保持稳定
+
+## 实现说明(改用 manager,非手搓)
+
+计划原文是手搓 WDA+WDS 路径。子计划 07 决策改为复制 manager 全包,因此本计划
+通过 `manager.NewWithClient` + `StartCore` + `Connect` 实现拨号,而非直接调 service。
+manager 内部自动处理 CTL GetClientID、WDA SetDataFormat、WDS StartNetwork、
+NBA/DMS/UIM indication 注册。`cmd/qmidial/main.go` 是验证工具。
+
+修复:control GET buffer 从 readLoop 的 16KB 改为独立 2048B(WinUSB 拒绝大 buffer)。
 
 ## 风险
 
 | 风险 | 缓解 |
 |---|---|
-| raw-IP vs QMAP 协商 | WDA SetDataFormat 配置 LinkProtocolIP;若模组返回 QMAP,数据包有 4 字节头(阶段 3 TUN 处理,阶段 2 信令不受影响) |
-| APN/鉴权配置 | cmnet(<运营商>);若需鉴权,StartNetworkInterface 的 username/password/authType 参数 |
-| 拨号失败(PS attach 未就绪) | 拨号前确认 SIM ready;manager 有 ensureSIMReady,手搓路径要自己查 AT+CGATT/CREG |
-| 没有 manager 的重连 | 本计划只做单次拨号验证;重连/断网恢复留待子计划 07 manager 决策 |
+| ~~raw-IP vs QMAP 协商~~ | manager 内部处理,验证通过 |
+| ~~APN/鉴权配置~~ | 3gnet 无鉴权,验证通过 |
+| ~~拨号失败(PS attach 未就绪)~~ | manager 内部 SIM check,验证通过 |
+| ~~没有 manager 的重连~~ | 改用 manager 全包,重连内置(USB 断连恢复留阶段 3) |
