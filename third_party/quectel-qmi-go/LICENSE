@@ -1,0 +1,32 @@
+# quectel-qmi-go — License Notice
+
+Source: github.com/iniwex5/quectel-qmi-go
+Copied: 2026-07-12 from vohive-release/source/quectel-qmi-go/
+
+## Status: NO LICENSE FILE FOUND
+
+The upstream source repository contains no LICENSE, COPYING, or NOTICE file.
+The README does not mention a license.
+
+This is a known risk (documented in plans/stage2/01-copy-and-export-injection.md).
+Before any redistribution or production use, the license must be confirmed with
+the author (iniwex5).
+
+## What was copied
+
+- `pkg/qmi/` → `qmi/` (34 Go files) — QMI protocol stack (QMUX framing,
+  service wrappers: WDS/WDA/DMS/NAS/UIM/WMS/IMS/VOICE)
+- `pkg/netcfg/` → `netcfg/` (8 Go files) — platform network configuration
+  (Linux/macOS/Windows, used in stage 3)
+
+## What was NOT copied
+
+- `pkg/manager/` — couples to Linux device discovery (subplan 07 decision)
+- `pkg/device/` — Linux sysfs device discovery
+
+## Modifications
+
+- `transport_export.go` added: exports `Transport` (alias for `qmiTransport`)
+  and `NewClientFromTransport()` — the injection point for user-space USB
+  transport (bypasses /dev/cdc-wdm0 kernel driver dependency).
+- No other source files modified.

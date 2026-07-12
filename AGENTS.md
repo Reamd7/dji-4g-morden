@@ -67,6 +67,16 @@
 
 **+CMTI 实时收信管道接入(2026-07-12)**:`SetSMSCallback(cb)` 启用 +CMTI 自动收信(+CMTI URC → CMGR 读 → DecodeDeliver → smscodec.Reassembler 重组 → CMGD 删除 → cb 回调)。`handleIncomingSMS` 在独立 goroutine 避免 readerLoop 死锁。Reassembler 真正接入(原计划留阶段 2,已提前完成)。
 
+**QMI Phase 0 探针完成(2026-07-12)**:`cmd/qmiprobe/` 实测 QMI 传输模型。**结论:模型 B(EP0 控制封装),需先设 DTR。**
+- 模组实为 **QDC507**(DJI 定制版,固件 QDC507GLEFM21),非标准 EC25。`AT+QCFG="usbnet",0`(QMI 模式)、`AT+CGATT: 1`(PS 已附着)
+- **关键发现:必须先发 DTR**(CDC `SetControlLineState`,bRequest=0x22,wValue=0x0001,wIndex=4),否则模组不响应任何 QMI 请求。源自 Linux `qmi_wwan.c`:`QMI_MATCH_FF_FF_FF(0x2c7c,0x0125)` → `qmi_wwan_info_quirk_dtr` → `qmi_wwan_change_dtr(dev,true)`。注释原文:"The device will not respond to QMI requests until we set DTR"
+- **MI_04(FF/FF/FF,3 EP)模型 B:WORKS**。设 DTR 后 `SEND_ENCAPSULATED_COMMAND`→`GET_ENCAPSULATED_RESPONSE` 返回 19 字节 `SYNC_RESP`(TLV result=SUCCESS)。Interrupt EP 0x89 发出 `RESPONSE_AVAILABLE`(`a1 01 00 00 04 00 00 00`)
+- MI_04 模型 A(bulk EP 0x05→0x88):不通,即使设了 DTR。Bulk 写入 USB 层成功但无响应
+- MI_00(FF/FF/FF,2 EP)模型 A(bulk):不通(DM/DIAG 口,非 QMI)
+- SYNC 帧已验证:按 quectel-qmi-go `Packet.Marshal()` 构造,12 字节 `01 0B 00 00 00 00 00 01 27 00 00 00`(计划原文 13 字节帧有误)
+- **阶段 2 解除阻塞**:子计划 02 按 **模型 B + DTR** 实现 `QMITransport`。TX=`Control(0x21,0x00,...)`,RX=`interrupt 0x89`→`Control(0xA1,0x01,...)`
+- 详见 `plans/stage2/00-phase0-transport-probe.md` 实测结果章节
+
 ### 目录结构
 
 - `docs/` —— 调研报告(中文 markdown)
@@ -299,9 +309,19 @@ dji-modem-research/
 │       ├── binary_classifier.go # 8-bit 二进制短信分类(OMA CP/WAP/MMS,当前不验证)
 │       ├── wbxml_omacp.go       # OMA CP WBXML 解码(同上)
 │       └── *_test.go            # reassembler/pdu 编码/pdu_trim 离线回归向量
+│   └── quectel-qmi-go/  # 从 vohive 复制的 QMI 协议栈(license 待确认)
+│       ├── LICENSE              # NOTICE:源码无 license 文件,待确认
+│       ├── qmi/                 # 协议栈核心(34 Go 文件):QMUX 分帧 + WDS/WDA/DMS/NAS/UIM/WMS/IMS/VOICE
+│       │   ├── client.go        # Client + readLoop/writerLoop/indicationLoop + SyncOnOpen
+│       │   ├── transport.go     # qmiTransport 接口(Read/Write/Close/SetReadDeadline)
+│       │   ├── transport_export.go # NewClientFromTransport + Transport 导出(注入点)
+│       │   ├── frame.go         # QMUX/CTL/Service 帧编解码 + Packet.Marshal/Unmarshal
+│       │   └── *.go             # 各 service wrapper + 测试
+│       └── netcfg/              # 三平台网络配置(Linux/macOS/Windows,阶段 3 用)
 ├── cmd/
 │   ├── usbprobe/    # USB 接口/endpoint 枚举探针(硬件,go run)
-│   └── attest/      # MI_02 AT 通路验证(硬件,go run)
+│   ├── attest/      # MI_02 AT 通路验证(硬件,go run)
+│   └── qmiprobe/    # QMI 传输模型探针(Phase 0:bulk A + control B,硬件,go run)
 ├── issue/
 │   └── 001-gousb-close-transfer-cancel-crash.md  # WinUSB cancel 崩溃判别实验(方向F 根因)
 ├── plans/
@@ -321,8 +341,8 @@ dji-modem-research/
 
 - `go.mod` 模块名:`dji-modem-research`
 - 依赖:`github.com/google/gousb`(USB)、`github.com/rs/zerolog` + `go.bug.st/serial`(modem 包保留)、`github.com/warthog618/sms`(smscodec 用,MIT)
-- 运行探针:`mise exec -- go run ./cmd/usbprobe/`
 - 运行 AT 测试:`mise exec -- go run ./cmd/attest/`
+- 运行 QMI 探针:`mise exec -- go run ./cmd/qmiprobe`
 - 跑 mock 单测:`make test-race`
 - 跑硬件集成测试(需 EC25 + WinUSB):`make test-hardware`
 
@@ -332,3 +352,4 @@ dji-modem-research/
 
 - **`sms-gateway/modem/`**(AGPL-3.0):AT 协议"壳"。核心改动:`port serial.Port` → `io.ReadWriteCloser` + `NewFromIO`(transport 注入);`readLine` USB 适配(`>` 提示符 + 逐字节读,方向F);`pdu.go` facade 化(委托 smscodec);补 11 条 AT 命令(network/sim/config 新文件);`SetSMSCallback` +CMTI 实时收信管道。保留 ICMP ping / zerolog / Open 串口路径。
 - **`smscodec/`**(vohive PolyForm NC + warthog618 MIT):PDU 编解码"芯"。**verbatim 一行不改**,委托 warthog618/sms 完整实现 TS 23.040(GSM-7 扩展表/长短信分段/重组),加国产模组容错(pdu_trim.go)。零 vohive 内部包依赖(复制前提)。
+- **`quectel-qmi-go/`**(license 待确认):QMI 协议栈。复制 `pkg/qmi/`(34 文件,QMUX 分帧 + WDS/WDA/DMS/NAS/UIM/WMS/IMS/VOICE service wrapper)+ `pkg/netcfg/`(三平台网络配置,阶段 3 用)。新增 `transport_export.go` 导出 `NewClientFromTransport` + `Transport` 接口别名,注入用户态 USB transport(模型 B + DTR),绕过 `/dev/cdc-wdm0` 内核驱动依赖。不复制 manager/device(Linux 耦合)。

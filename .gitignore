@@ -16,3 +16,6 @@
 # Go workspace files (local only)
 /go.work
 /go.work.sum
+
+# Linux driver reference source (cloned separately, not tracked)
+/references/linux-driver/
