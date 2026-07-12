@@ -1,0 +1,34 @@
+# PII patterns for pre-commit hook (grep -E regex syntax, one per line).
+# Copy this file to .piipatterns and fill in real values.
+# .piipatterns is gitignored — real values never enter version control.
+#
+# Each non-empty, non-comment line is treated as a regex pattern.
+# Patterns are OR'd together and matched case-insensitively against
+# added lines in staged text files (.go .md .txt .json .yaml .yml .bat .sh .inf).
+
+# IMEI (15 digits)
+# 860000000000000
+
+# ICCID (20 digits)
+# 89000000000000000000
+
+# IMSI (15 digits)
+# 460000000000000
+
+# Phone number (without +86 prefix, 11 digits)
+# 138000000000
+
+# Carrier-assigned IPv4 prefix
+# 10\.0\.0\.
+
+# Carrier DNS
+# 114\.114\.114\.114
+
+# Carrier name
+# Carrier
+
+# SMSC
+# 8613800000000
+
+# Carrier-assigned IPv6 prefix
+# 2001:db8:

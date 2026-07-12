@@ -41,6 +41,41 @@ if [[ "$(uname -s)" == MINGW* ]] || [[ "$(uname -s)" == MSYS* ]]; then
 	export CC="C:\\msys64\\mingw64\\bin\\gcc.exe"
 	export PKG_CONFIG_PATH="C:\\msys64\\mingw64\\lib\\pkgconfig"
 	export PATH="$GOPATH/bin:/c/msys64/mingw64/bin:$PATH"
+
+fi
+ROOT="$(git rev-parse --show-toplevel)"
+PII_FILE="$ROOT/.piipatterns"
+
+# PII patterns are stored in .piipatterns (gitignored, NOT in version control).
+# See .piipatterns.example for format and setup instructions.
+# If .piipatterns is missing, PII check is skipped with a warning.
+if [ ! -f "$PII_FILE" ]; then
+  echo "pre-commit: ⚠️  .piipatterns not found — PII check skipped." >&2
+  echo "  Copy .piipatterns.example → .piipatterns and fill in real patterns." >&2
+else
+  echo "pre-commit: checking staged content for PII..."
+  # Each line in .piipatterns is a regex pattern (grep -E syntax).
+  # Empty lines and lines starting with # are ignored.
+  PII_REGEX=$(grep -v '^#' "$PII_FILE" | grep -v '^$' | paste -sd'|' -)
+
+  if [ -n "$PII_REGEX" ]; then
+    PII_HITS=$(git diff --cached -U0 --diff-filter=ACM -- \
+      '*.go' '*.md' '*.txt' '*.json' '*.yaml' '*.yml' '*.bat' '*.sh' '*.inf' \
+      | grep -E '^\+' | grep -iE "$PII_REGEX" 2>/dev/null || true)
+
+    if [ -n "$PII_HITS" ]; then
+      echo "" >&2
+      echo "pre-commit: ❌ PII DETECTED in staged changes — commit aborted." >&2
+      echo "" >&2
+      echo "$PII_HITS" >&2
+      echo "" >&2
+      echo "Redact these values before committing." >&2
+      echo "Bypass with 'git commit --no-verify' (NOT recommended for PII)." >&2
+      exit 1
+    fi
+  fi
+
+  echo "pre-commit: PII check passed ✓"
 fi
 
 echo "pre-commit: running go test ./internal/... (race detector on)"

@@ -7,6 +7,9 @@
 *.test
 *.out
 
+# PII detection patterns (real values — must NOT be committed)
+.piipatterns
+
 # Plan files (editor scratch)
 .zcode/
 
