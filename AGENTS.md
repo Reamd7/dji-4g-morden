@@ -152,7 +152,7 @@ type DataSink interface {
 - `docs/11-quectel-driver-mbb-mechanism.md` — 官方驱动「移动数据」面板机制(IF_TYPE_WWANPP)
 - `docs/12-voice-call-feasibility.md` — 语音通话可行性分析(未创建,待探测后写)
 
-### 未来方向:语音通话(2026-07-13 记录)
+### 探索性记录:语音通话(低优先级,2026-07-13)
 
 PC 上接听/拨打语音通话。信令控制(AT ATA/ATD/ATH/CLIP)已可做(同短信机制),**音频通路是核心难点**——QDC507 的 5 个 USB 接口均无 USB Audio Class (UAC),音频默认走 PCM/I2S 物理引脚,不在 USB 上。
 
