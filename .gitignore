@@ -19,3 +19,5 @@
 
 # Linux driver reference source (cloned separately, not tracked)
 /references/linux-driver/
+cmd/qmidial/qmidial_out.txt
+cmd/qmidial/qmidial_done.txt
