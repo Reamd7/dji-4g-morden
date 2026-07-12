@@ -77,6 +77,13 @@
 - **阶段 2 解除阻塞**:子计划 02 按 **模型 B + DTR** 实现 `QMITransport`。TX=`Control(0x21,0x00,...)`,RX=`interrupt 0x89`→`Control(0xA1,0x01,...)`
 - 详见 `plans/stage2/00-phase0-transport-probe.md` 实测结果章节
 
+**QMI 拨号成功(2026-07-12)**:纯用户态 USB → QMI → WDS 拨号 → 拿到运营商 IP。零内核驱动,Windows 上跑通。
+- `cmd/qmidial/` 工具:`QMITransport` → `qmi.NewClientFromTransport`(SYNC)→ `manager.NewWithClient`(hook 注入,绕过 /dev/cdc-wdm0)→ `StartCore`(NAS/DMS/UIM/WDA/WDS 全 service)→ `Connect`(WDS StartNetwork)
+- 拨号结果:IPv4 `10.147.0.1/27`、Gateway `10.147.0.2`、DNS `114.114.114.114, 223.5.5.5`、MTU `1500`
+- **修复**:control GET buffer 从 readLoop 的 16KB 改为独立 2048B — WinUSB 拒绝大 buffer(`libusb_error_invalid_param`)。QMUX 帧 < 1500B(IP MTU),2048 足够
+- manager 全包复制(子计划 07):`NewWithClient` 利用 `openClientAndAllocateServicesHook` 注入预构造 client,绕过 Linux 设备发现。新增依赖 logrus/zap
+- **阶段 2 核心目标达成**
+
 ### 目录结构
 
 - `docs/` —— 调研报告(中文 markdown)
