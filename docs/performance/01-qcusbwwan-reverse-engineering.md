@@ -1,21 +1,27 @@
-# qcusbwwan.sys 逆向分析:userland 性能优化启发
+# Quectel 驱动逆向分析:userland 性能优化启发
 
 > 调研日期: 2026-07-12
-> 目标文件: `qcusbwwan.sys` (583KB, NDIS 6.2 WWAN miniport)
+> 目标文件: `qcusbwwan.sys` (583KB) + `qcusbfilter.sys` (63KB) + `qcusbser.sys` (256KB)
 > 来源: Quectel_LTE&5G_Windows_USB_Driver_V2.2.4 (2020-09-18)
 > 方法: strings + PE imports 提取(非完整反汇编)
 
 ## 驱动来源确认
 
-```
-qcusbwwan.sys PDB:
-  F:\DriverWorkSpace\work\R03\QMI\win\qcwwan\ndis\MPQMUX.c
+三个 `.sys` 全部来自 **Qualcomm 官方 QUD (Qualcomm USB Driver)**:
 
-qcusbfilter.sys PDB:
-  E:\MyProWin10\windows_driver\R02\qud-win-1-1_qti-tools_device_source.git
+```
+qcusbwwan.sys PDB:   F:\DriverWorkSpace\work\R03\QMI\win\qcwwan\ndis\MPQMUX.c
+qcusbfilter.sys PDB: ...\qud-win-1-1_qti-tools_device_source.git\QMI\win\qcwwan\filter\
+qcusbser.sys PDB:    ...\qud-win-1-1_qti-tools_device_source.git\QMI\win\qcwwan\serial\
 ```
 
-这是 **Qualcomm 官方 QUD (Qualcomm USB Driver)** 的 Quectel 定制版,基于 Gobi 驱动架构。内含完整 QMI 协议栈。
+这是 Qualcomm QUD 的 Quectel 定制版,基于 Gobi 驱动架构。三个驱动分工:
+
+| 驱动 | 大小 | 职责 | userland 对应 |
+|---|---|---|---|
+| **qcusbwwan.sys** | 583KB | NDIS 6.2 WWAN miniport:QMI 控制 + 数据收发 + QMAP 聚合 | `qmitransport` + `qmidatapath` + `qmidial` |
+| **qcusbfilter.sys** | 63KB | USB composite lower filter:QMI 接口 MUX 路由 | 无(我们直接 claim MI_04) |
+| **qcusbser.sys** | 256KB | USB-to-serial 桥接:AT/DM/NMEA/Modem → COM3~5 | `usbtransport`(我们直接 claim MI_02 bulk) |
 
 ## 驱动栈(4 层)
 
@@ -34,6 +40,78 @@ qcusbfilter.sys (63KB)  ← USB lower filter
          ↕
 USB Composite Device (PID 2C7C:0125) → MI_04
 ```
+
+## qcusbfilter.sys 分析(63KB,USB composite lower filter)
+
+极简驱动,二进制剥离严重,strings 仅剩证书链和 `filter_unknown`。关键信息来自 INF + 注册表键:
+
+```ini
+; qcfilter.inf — LowerFilters 注册
+[LowerFilterAddReg]
+HKR,,"LowerFilters",0x00010000,"qcfilter"
+
+; 接口 MUX 配置(qcfilter.inf 注册表)
+HKR,, QCDeviceMuxEnable, 0x00010001, 0x00000001   ; 启用 QMI MUX
+HKR,, QCDeviceStartIf,   0x00010001, 0x0000000N   ; 起始接口(MI_02/03/04)
+HKR,, QCDeviceNumIf,     0x00010001, 0x00000001   ; 实际接口数=1
+HKR,, QCDeviceNumMuxIf,  0x00010001, 0x00000007   ; MUX 虚拟接口=7
+```
+
+**作用**: 挂在 USB composite 设备(uscbccgp)下沿,拦截 IRP,实现 QMI 接口多路复用。让 `qcusbwwan` 和 `qcusbser` 共享同一组 USB bulk endpoint,最多虚拟 7 个独立数据 session。
+
+**对 userland 的意义**: 我们不需要。直接 `gousb claim MI_04` 就能独占 QMI bulk endpoint,无需 MUX。MUX 仅在多 PDP context(多 APN 同时拨号)时有意义。
+
+## qcusbser.sys 分析(256KB,USB-to-serial 桥接)
+
+完整的 USB-CDC 串口驱动,把 MI_00~03 的 USB bulk endpoint 桥接成 Windows COM 端口。
+
+### USB 栈
+```
+USBD.SYS
+  → USBD_CreateConfigurationRequestEx  // 选择 USB 配置
+  → USBD_ParseConfigurationDescriptorEx // 解析描述符
+```
+
+### 串口 IOCTL 全集(标准 Windows serial)
+```
+IOCTL_SERIAL_SET_BAUD_RATE / GET_BAUD_RATE
+IOCTL_SERIAL_SET_DTR / CLR_DTR / GET_DTRRTS
+IOCTL_SERIAL_SET_RTS / CLR_RTS
+IOCTL_SERIAL_SET_CHARS / GET_CHARS
+IOCTL_SERIAL_SET_HANDFLOW / GET_HANDFLOW   // 流控(XON/XOFF, RTS/CTS)
+IOCTL_SERIAL_GET_COMMSTATUS                // 线路状态
+IOCTL_SERIAL_GET_MODEMSTATUS               // DCD/DSR/CTS/RI
+IOCTL_SERIAL_GET_PROPERTIES                // 驱动能力
+IOCTL_SERIAL_SET_TIMEOUTS / GET_TIMEOUTS   // 读写超时
+IOCTL_SERIAL_SET_WAIT_MASK                 // 事件等待掩码
+IOCTL_SERIAL_PURGE                         // 清缓冲
+IOCTL_SERIAL_CLEAR_STATS / GET_STATS       // 统计
+IOCTL_SERIAL_SET_BREAK_ON / SET_BREAK_OFF  // Break 信号
+IOCTL_SERIAL_IMMEDIATE_CHAR                // 立即发送
+```
+
+### 自定义 IOCTL
+```
+IOCTL_QCUSB_DEVICE_POWER     // 设备电源管理
+IOCTL_QCUSB_SYSTEM_POWER     // 系统电源管理
+IOCTL_QCUSB_QCDEV_NOTIFY     // 设备事件通知
+IOCTL_QCSER_GET_SERVICE_KEY  // 获取服务注册表键
+```
+
+### 调试日志
+```
+QCSER_CreateLogFile, ucRxFileName.Buffer   // Rx 数据 dump
+QCSER_CreateLogFile, ucTxFileName.Buffer   // Tx 数据 dump
+```
+
+### PnP
+```
+PnPAddDevice, ucDeviceName.Buffer          // COM 端口名(如 "COM5")
+PnPAddDevice, ucDeviceMapEntry.Buffer      // 设备映射注册表
+IRP_MN_FILTER_RESOURCE_REQUIREMENTS        // 资源过滤
+```
+
+**对 userland 的意义**: 我们的 `usbtransport.go` 做了完全相同的事(USB bulk → 字节流),但跳过了 COM 端口抽象,直接用 gousb 读 bulk endpoint。省了一层内核 serial 栈,延迟更低。qcusbser 的流控/超时/事件掩码机制对我们无参考价值——AT 命令不需要硬件流控。
 
 ## 内部 QMI 栈(从 strings 提取)
 
