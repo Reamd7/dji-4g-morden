@@ -9,7 +9,12 @@ import (
 
 // DarwinConfigurator implements NetworkConfigurator for macOS
 // DarwinConfigurator 为 macOS 实现 NetworkConfigurator
-type DarwinConfigurator struct{}
+type DarwinConfigurator struct {
+	// v4addr stashes the IPv4 local address from SetIPAddress. macOS utun is
+	// point-to-point and needs a destination (the gateway) to configure inet,
+	// which only arrives in AddDefaultRoute — so IPv4 is configured there.
+	v4addr net.IP
+}
 
 func NewDarwinConfigurator() *DarwinConfigurator {
 	return &DarwinConfigurator{}
@@ -24,8 +29,16 @@ func (d *DarwinConfigurator) run(name string, args ...string) error {
 }
 
 func (d *DarwinConfigurator) SetIPAddress(ifname string, ip net.IP, prefixLen int) error {
-	// ifconfig ifname inet IP/Prefix alias
-	return d.run("ifconfig", ifname, "inet", fmt.Sprintf("%s/%d", ip.String(), prefixLen), "alias")
+	if ip.To4() != nil {
+		// Defer IPv4: macOS utun is point-to-point and requires a destination
+		// address (the gateway) to configure inet. Both "alias" and plain
+		// "inet IP/PREFIX" fail on a primary-less utun (observed: utun ends up
+		// with inet6 but no inet). Stash local; configure in AddDefaultRoute.
+		d.v4addr = ip
+		return nil
+	}
+	// inet6 alias works on utun (observed: inet6 set successfully).
+	return d.run("ifconfig", ifname, "inet6", fmt.Sprintf("%s/%d", ip.String(), prefixLen), "alias")
 }
 
 func (d *DarwinConfigurator) SetIPv6Address(ifname string, ip net.IP, prefixLen int) error {
@@ -40,11 +53,25 @@ func (d *DarwinConfigurator) FlushAddresses(ifname string) error {
 }
 
 func (d *DarwinConfigurator) AddDefaultRoute(ifname string, gateway net.IP) error {
-	// route add default gateway -interface ifname
+	// Configure the deferred point-to-point IPv4 (local + gateway as dest),
+	// then add the default route via -iface (link-direct, no ARP on pt-to-pt).
 	if gateway.To4() != nil {
-		return d.run("route", "add", "default", gateway.String(), "-interface", ifname)
+		if d.v4addr != nil {
+			if err := d.run("ifconfig", ifname, "inet", d.v4addr.String(), gateway.String()); err != nil {
+				return err
+			}
+		}
+		// macOS default route already exists (main network en0); "route add
+		// default" fails with "File exists". Use the VPN-standard split: 0/1 +
+		// 128/1 cover all of 0.0.0.0/0, are more specific than the existing
+		// default, and take precedence without removing it. FlushRoutes
+		// removes them on disconnect, restoring the main default.
+		if err := d.run("route", "-n", "add", "0/1", "-iface", ifname); err != nil {
+			return err
+		}
+		return d.run("route", "-n", "add", "128/1", "-iface", ifname)
 	}
-	return d.run("route", "add", "-inet6", "default", gateway.String(), "-interface", ifname)
+	return d.run("route", "-n", "add", "-inet6", "default", "-iface", ifname)
 }
 
 func (d *DarwinConfigurator) AddDefaultRouteDirect(ifname string, ipv6 bool) error {
@@ -55,7 +82,10 @@ func (d *DarwinConfigurator) AddDefaultRouteDirect(ifname string, ipv6 bool) err
 }
 
 func (d *DarwinConfigurator) FlushRoutes(ifname string) error {
-	// macOS doesn't have a simple flush per interface
+	// Remove the split default routes (0/1 + 128/1) added by AddDefaultRoute.
+	// Ignore errors — routes may already be gone once the utun closes.
+	d.run("route", "-n", "delete", "0/1", "-iface", ifname)
+	d.run("route", "-n", "delete", "128/1", "-iface", ifname)
 	return nil
 }
 

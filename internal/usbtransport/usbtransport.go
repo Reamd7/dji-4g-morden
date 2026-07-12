@@ -18,6 +18,28 @@ import (
 	"github.com/google/gousb"
 )
 
+// sharedContext returns a process-wide singleton gousb.Context.
+//
+// gousb.Context wraps a libusb context that should be reused across device
+// opens. Creating a fresh context per Open and closing it on Close is unsafe
+// on macOS: libusb_init_context fails (LIBUSB_ERROR_OTHER, code -99) when a
+// second context is initialized after the first was torn down in the same
+// process, and gousb panics on that error. A single shared context avoids
+// repeated init/exit and matches gousb's intended usage (one context, many
+// devices). The context is never closed; it lives for the process lifetime
+// (OS reclaims it on exit), correct for both CLI tools and tests.
+var (
+	sharedCtxOnce sync.Once
+	sharedCtx     *gousb.Context
+)
+
+func sharedContext() *gousb.Context {
+	sharedCtxOnce.Do(func() {
+		sharedCtx = gousb.NewContext()
+	})
+	return sharedCtx
+}
+
 // ATTransport wraps MI_02 (AT command port) USB bulk endpoints as an
 // io.ReadWriteCloser. It is the USB-side counterpart of go.bug.st/serial's
 // serial.Port for the AT command channel.
@@ -63,7 +85,7 @@ type endpointWriter interface {
 // The returned ATTransport must be Close()d to release the USB interface
 // claim and configuration.
 func Open(vid, pid uint16, ifaceNum, epOut, epIn int) (*ATTransport, error) {
-	ctx := gousb.NewContext()
+	ctx := sharedContext()
 	dev, err := ctx.OpenDeviceWithVIDPID(gousb.ID(vid), gousb.ID(pid))
 	if err != nil {
 		return nil, fmt.Errorf("usbtransport: open %04x:%04x: %w", vid, pid, err)
@@ -176,12 +198,6 @@ func (t *ATTransport) Close() error {
 	}
 	if t.dev != nil {
 		if err := t.dev.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	// Close the gousb context last, after all devices are released.
-	if t.ctx != nil {
-		if err := t.ctx.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

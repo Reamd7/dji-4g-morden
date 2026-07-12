@@ -209,12 +209,7 @@ func main() {
 				fmt.Println("      OK — DNS configured")
 			}
 		}
-		// Allow ICMP through Windows Firewall
-		fmt.Println("      Adding Windows Firewall ICMP rules...")
-		runCommand("netsh", "advfirewall", "firewall", "add", "rule",
-			"name=qmi-tun-icmp-out", "protocol=icmpv4:8,any", "dir=out", "action=allow")
-		runCommand("netsh", "advfirewall", "firewall", "add", "rule",
-			"name=qmi-tun-icmp-in", "protocol=icmpv4:0,any", "dir=in", "action=allow")
+		allowICMPFirewall()
 
 		tunIP := ""
 		if s := mgr.Settings(); s != nil && len(s.IPv4Address) > 0 {
@@ -223,21 +218,38 @@ func main() {
 
 		time.Sleep(2 * time.Second) // let relay stabilize
 
+		// Diagnostics: confirm the default route points at the TUN and show DNS
+		// resolver state. The manager's logrus logs aren't surfaced here, so a
+		// silent route-add failure (or a route that doesn't actually carry
+		// traffic) would otherwise be invisible.
+		fmt.Println("\n── Routing/interface diagnostics ──")
+		runCommand("netstat", "-rn", "-f", "inet")
+		if runtime.GOOS == "darwin" {
+			runCommand("ifconfig", tunName)
+			runCommand("scutil", "--dns")
+		} else if runtime.GOOS == "windows" {
+			runCommand("ipconfig", tunName)
+		}
+		fmt.Println("── end diagnostics ──")
+
 		// ════════════════════════════════════════════════════════════════
 		// Phase 1: High-metric route — source-bound (-S) goes through 4G,
 		//           default traffic stays on main network (lower metric wins)
 		// ════════════════════════════════════════════════════════════════
-		fmt.Println("\n════ Phase 1: Source-bound (qmi0 metric=100, main=25) ══")
-		fmt.Printf("  Setting %s metric=100 (main network wins by default)...\n", tunName)
-		runCommand("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=100")
+		fmt.Println("\n════ Phase 1: Source-bound (bind to TUN IP) ══════════")
+		setInterfaceMetric(tunName, 100)
 
 		fmt.Println("  [1a] Main network — ping baidu.com:")
 		runCommand("ping", platformPingArgs("baidu.com")...)
 		if tunIP != "" {
-			fmt.Printf("  [1b] 4G TUN — ping -S %s baidu.com:\n", tunIP)
-			runCommand("ping", platformPingArgsWithSource("baidu.com", tunIP)...)
+			if srcArgs := platformPingArgsWithSource("baidu.com", tunIP); srcArgs != nil {
+				fmt.Printf("  [1b] 4G TUN — ping -S %s baidu.com:\n", tunIP)
+				runCommand("ping", srcArgs...)
+			} else {
+				fmt.Printf("  [1b] 4G TUN — ping source-bound: skipped (macOS ping -I takes an iface name, not an IP; curl --interface covers it)\n")
+			}
 			fmt.Println("  [1c] 4G TUN — curl --interface:")
-			runCommand("curl", "-s", "-o", "NUL", "-w", "%{http_code} %{time_total}s",
+			runCommand("curl", "-s", "-o", nullDevice(), "-w", "%{http_code} %{time_total}s",
 				"--interface", tunIP, "http://www.baidu.com")
 			fmt.Println()
 		}
@@ -247,20 +259,18 @@ func main() {
 		// ════════════════════════════════════════════════════════════════
 		// Phase 2: Global TUN — metric=1 (ALL traffic → 4G)
 		// ════════════════════════════════════════════════════════════════
-		fmt.Println("\n════ Phase 2: Global TUN (metric=1, all → 4G) ══════════")
-		fmt.Printf("  Setting %s metric=1...\n", tunName)
-		runCommand("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=1")
+		fmt.Println("\n════ Phase 2: Global TUN (all traffic → 4G) ═══════════")
+		setInterfaceMetric(tunName, 1)
 
 		fmt.Println("  [2a] ping baidu.com (all through 4G):")
 		runCommand("ping", platformPingArgs("baidu.com")...)
 		fmt.Println("  [2b] curl http://www.baidu.com:")
-		runCommand("curl", "-s", "-o", "NUL", "-w", "%{http_code} %{time_total}s", "http://www.baidu.com")
+		runCommand("curl", "-s", "-o", nullDevice(), "-w", "%{http_code} %{time_total}s", "http://www.baidu.com")
 		fmt.Println()
 		fmt.Println("  [2c] nslookup baidu.com:")
 		runCommand("nslookup", "baidu.com")
 
-		// Reset metric before cleanup
-		runCommand("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=auto")
+		setInterfaceMetric(tunName, -1) // reset to auto (Windows only)
 
 		txPkt2, txByt2, rxPkt2, rxByt2 := bridge.Stats()
 		fmt.Printf("\n  Relay stats: TX %d pkts/%d B, RX %d pkts/%d B\n", txPkt2, txByt2, rxPkt2, rxByt2)
@@ -276,6 +286,8 @@ func main() {
 
 	// Cleanup (order matters: tun.Close → bridge.Stop → mgr.Stop → transport.Close)
 	fmt.Println("\nDisconnecting...")
+	fmt.Println("  Restoring DNS to pre-4G values...")
+	restoreDNS()
 	if bridge != nil {
 		bridge.Stop()
 	}
@@ -367,5 +379,48 @@ func platformPingArgsWithSource(host, srcIP string) []string {
 	if runtime.GOOS == "windows" {
 		return []string{"-n", "4", "-S", srcIP, host}
 	}
+	if runtime.GOOS == "darwin" {
+		// macOS ping -I takes an interface NAME, not a source IP, and rejects
+		// it for unicast destinations ("flags cannot be used with unicast
+		// destination"). Source-bound ping isn't supported on macOS; return
+		// nil so the caller skips it (curl --interface already covers this).
+		return nil
+	}
 	return []string{"-c", "4", "-I", srcIP, host}
+}
+
+// nullDevice returns the platform null-output path for curl -o etc.
+// NUL on Windows, /dev/null on Unix.
+func nullDevice() string {
+	if runtime.GOOS == "windows" {
+		return "NUL"
+	}
+	return "/dev/null"
+}
+
+// setInterfaceMetric sets the interface route metric on Windows (netsh).
+// No-op on macOS/Linux: the manager's netcfg (DarwinConfigurator) already
+// added the default route via AddDefaultRouteDirect, so traffic is routed
+// to the TUN without needing a metric override. metric < 0 means "reset auto".
+func setInterfaceMetric(ifname string, metric int) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	m := fmt.Sprintf("metric=%d", metric)
+	if metric < 0 {
+		m = "metric=auto"
+	}
+	runCommand("netsh", "interface", "ipv4", "set", "interface", ifname, m)
+}
+
+// allowICMPFirewall adds ICMP allow rules on Windows Firewall; no-op elsewhere.
+func allowICMPFirewall() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	fmt.Println("      Adding Windows Firewall ICMP rules...")
+	runCommand("netsh", "advfirewall", "firewall", "add", "rule",
+		"name=qmi-tun-icmp-out", "protocol=icmpv4:8,any", "dir=out", "action=allow")
+	runCommand("netsh", "advfirewall", "firewall", "add", "rule",
+		"name=qmi-tun-icmp-in", "protocol=icmpv4:0,any", "dir=in", "action=allow")
 }

@@ -21,22 +21,27 @@ if [ -z "$GOROOT" ]; then
 fi
 GO="$GOROOT/bin/go"
 
-# Project-local GOPATH + Windows env vars that go.exe needs (mirrors Makefile).
-# USERPROFILE is always set on Windows (git-bash inherits it); fall back to $HOME.
+# Project-local GOPATH (cross-platform — both Windows and macOS use this).
 ROOT="$(git rev-parse --show-toplevel)"
 export GOPATH="$ROOT/.gopath"
 export GOBIN=""
-USER_HOME="${USERPROFILE:-$HOME}"
-# Convert /c/Users/... to C:\Users\... so go.exe (a Windows binary) accepts it.
-WIN_HOME="$(echo "$USER_HOME" | sed 's|^/\([a-zA-Z]\)/|\1:\\|; s|/|\\|g')"
-export LocalAppData="${LocalAppData:-${WIN_HOME}\\AppData\\Local}"
-export APPDATA="${APPDATA:-${WIN_HOME}\\AppData\\Roaming}"
-export TMP="${TMP:-${WIN_HOME}\\AppData\\Local\\Temp}"
-export TEMP="${TEMP:-${WIN_HOME}\\AppData\\Local\\Temp}"
-export GOTMPDIR="${GOTMPDIR:-${WIN_HOME}\\AppData\\Local\\Temp}"
-export CC="C:\\msys64\\mingw64\\bin\\gcc.exe"
-export PKG_CONFIG_PATH="C:\\msys64\\mingw64\\lib\\pkgconfig"
-export PATH="$GOPATH/bin:/c/msys64/mingw64/bin:$PATH"
+
+# Windows-only env: go.exe is a Windows binary and needs Windows-style paths
+# + the mingw64 toolchain (mirrors Makefile). macOS/Linux use mise's go +
+# system clang/gcc + brew/system libusb directly, so no overrides needed.
+if [[ "$(uname -s)" == MINGW* ]] || [[ "$(uname -s)" == MSYS* ]]; then
+	USER_HOME="${USERPROFILE:-$HOME}"
+	# Convert /c/Users/... to C:\Users\... so go.exe (Windows binary) accepts it.
+	WIN_HOME="$(echo "$USER_HOME" | sed 's|^/\([a-zA-Z]\)/|\1:\\|; s|/|\\|g')"
+	export LocalAppData="${LocalAppData:-${WIN_HOME}\\AppData\\Local}"
+	export APPDATA="${APPDATA:-${WIN_HOME}\\AppData\\Roaming}"
+	export TMP="${TMP:-${WIN_HOME}\\AppData\\Local\\Temp}"
+	export TEMP="${TEMP:-${WIN_HOME}\\AppData\\Local\\Temp}"
+	export GOTMPDIR="${GOTMPDIR:-${WIN_HOME}\\AppData\\Local\\Temp}"
+	export CC="C:\\msys64\\mingw64\\bin\\gcc.exe"
+	export PKG_CONFIG_PATH="C:\\msys64\\mingw64\\lib\\pkgconfig"
+	export PATH="$GOPATH/bin:/c/msys64/mingw64/bin:$PATH"
+fi
 
 echo "pre-commit: running go test ./internal/... (race detector on)"
 # -race is mandatory for transport/concurrency code per AGENTS.md testing policy.

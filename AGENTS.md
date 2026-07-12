@@ -94,15 +94,47 @@
 - **Linux 驱动参考**:`references/linux-driver/q_drivers/qmi_wwan/qmi_wwan_q.c` 确认 EC25 默认 `qmap_mode=0`(raw-IP)、`FLAG_SEND_ZLP`、DTR 在 bind() 设置
 - **三阶段全部完成**:纯用户态 USB → AT+短信 → QMI 拨号 → TUN 上网,零内核驱动
 
+**macOS 平台验证启动(2026-07-12)**:Windows 全程跑通后转向 macOS(darwin/arm64)。零配置——brew libusb + go 默认 clang 即可,无需 Zadig/无需卸内核驱动。
+- AT 通路:`attest` + `TestHardwareModemInitializeAndCSQ` PASS(完整 Initialize 序列 + `+CSQ: 23,99`,0.04s)
+- 短信收发:`sms_hardware_test.go` 全套 PASS——`ListStored`+`DecodeDeliver` 读出 SIM 3 条中文短信(UCS-2)、`Send` 单段(CMGS 两步握手)、`SendMultiPart` 长短信分段。设备:ICCID `<ICCID>`/IMEI `<IMEI>`/<CARRIER>/本机 `<本机号>`/-59 dBm
+- **接口类**:usbprobe 实测 5 个接口均 `class=0xFF` vendor-specific,AppleUSBACM 只匹配 CDC-ACM(02/02)故无内核驱动抢占,gousb 直接 claim
+- **单例 context 修复**:macOS 上 gousb `NewContext()` 反复 init/exit 不可靠,第二次 `libusb_init_context` 返回 -99 且 gousb 直接 panic(连续多 hardware 测试崩)。改 `usbtransport` 为 package 级单例 context(`sharedContext` + `sync.Once`),Open 复用、Close 不关 context。修复后连续 5 个 hardware 测试全 PASS,Windows 同样受益
+- QMI SYNC 握手:`qmiprobe` 验证模型 B + DTR——设 DTR(CDC SetControlLineState,wIndex=4)后 EP0 控制封装(SEND_ENCAPSULATED_COMMAND `0x21,0x00` → GET_ENCAPSULATED_RESPONSE `0xA1,0x01`)返回 19 字节 SYNC_RESP(`01 12 00 80 00 00 01 01 27 00 07 00 02 04 00 00 00 00 00`,MsgID `0x0027`,TLV result SUCCESS),与 Windows 逐字节一致。模型 A(bulk)无响应。结论:QMITransport 用 EP0 封装,阶段 2 物理基础 OK
+- QMI transport + 拨号:`qmitransport` hardware 测试全套 PASS(9 个 hardware + 12 个 mock,28s)——`TestHardwareSyncExchange`(SYNC_RESP 19B)、`TestHardwareManagerStartCore`(全 service 分配)、**`TestHardwareManagerDialup`(IPv4 `<IPv4>`/MTU 1500/PDH `<PDH>`)**、**`TestHardwareManagerDialupIPv6`(IPv6 `<IPv6-addr>/64` 双栈)**、并发 Close 5+10 轮稳定。**阶段 2 在 macOS 闭环**(零内核驱动,纯用户态 USB→QMI→WDS 拨号)。注:`qmitransport.openInternal` 也每次 `NewContext()`,但连续 hardware 测试未 panic(与 usbtransport 不同,疑 Close 实现差异,暂不改动)
+- TUN 上网(阶段 3):`qmidial -dial -tun` 端到端跑通——curl http://www.baidu.com HTTP 200(0.287s)、curl --interface <IPv4> HTTP 200(0.082s)、ping baidu.com 61-78ms、nslookup 经 4G DNS `<DNS1>` 解析成功(4 IP)。relay TX 1384 pkts/230KB + RX 1079 pkts/372KB(真实双向数据)。**三阶段在 macOS 全部闭环,零内核驱动**
+- **DarwinConfigurator 修复(macOS netcfg)**:`third_party/quectel-qmi-go/netcfg/darwin.go` 三处适配——(1) `SetIPAddress` IPv4 延迟到 `AddDefaultRoute`:utun 是 point-to-point 且无主地址,`inet alias` 与纯 `inet IP/PREFIX` 均失败(utun 只配得上 inet6),改为记 v4addr,在 AddDefaultRoute 用 `ifconfig utun inet LOCAL DEST`(point-to-point,dest=gateway);(2) `AddDefaultRoute` 用 `0/1`+`128/1` split 覆盖 default:macOS 已有 en0 的 default 路由,`route add default` 报 "File exists" 静默失败,split 比 default 更具体且不动现有路由,FlushRoutes 删除即可恢复;(3) 路由用 `-iface`(link-direct,point-to-point 无需 ARP gateway)
+
 ### 下一步:macOS 平台验证
 
-三阶段路线图在 **Windows 上全程跑通**(AT+短信+QMI拨号+TUN上网)。代码已设计为跨平台,但 macOS 尚未硬件验证。待办:
+三阶段路线图在 **Windows + macOS 上全程跑通**(AT+短信+QMI拨号+TUN 上网,零内核驱动)。代码已设计为跨平台。**macOS(2026-07-12,darwin/arm64)三阶段全部验证通过**:AT 通路 + 短信收发 + QMI(SYNC + 拨号 IPv4+IPv6 双栈)+ TUN 上网(curl HTTP 200/ping 61-78ms/DNS 解析)。brew libusb + 默认 clang,无需 Zadig/无需卸内核驱动。
 
-- **USB transport**:macOS 无需 Zadig(libusb 原生支持),gousb 应直接工作。验证 AT transport(MI_02)+ QMI transport(MI_04 model B + DTR)
-- **TUN**:wireguard/tun 在 macOS 用 utun(内核层),relay 需 `offset=4`(utun 前缀 4 字节 AF-family)。`tunToModem`/`modemToTun` 已支持 offset 参数
-- **DNS**:`dns.go` 已有 macOS 分支(`networksetup -setdnsservers`),需实测
-- **网络配置**:manager netcfg 的 macOS 路径需验证(IP/路由/MTU)
+- **USB transport**:macOS 无需 Zadig(libusb 原生支持),gousb 直接 claim 成功(5 接口均 `class=0xFF` vendor-specific,AppleUSBACM 不匹配,无内核驱动抢占)。✅ AT transport(MI_02);✅ QMI transport(MI_04 模型 B + DTR);✅ TUN 上网
+- **TUN**:wireguard/tun macOS utun,relay `offset=4` ✅ 已验证(utun 4 字节 AF-family 前缀,wireguard/tun Read/Write `offset-4:` 语义匹配)
+- **DNS**:`configureDNSDarwin`(`networksetup`)把运营商 DNS 配到主网络服务(Wi-Fi/Ethernet)——macOS 限制:utun 无 networksetup 管理的 Network Service,不能直接给 utun 配 DNS;DNS 解析又是全局的,所以临时借主网络服务设 4G DNS。经 split 路由走 utun9 → 4G 解析成功(`<DNS1>` nslookup 验证)。**退出自动恢复**:`configureDNSDarwin` 先 `networksetup -getdnsservers` 快照原值并注册 `dnsRestore` 闭包,cleanup 调 `restoreDNS()` 还原(原手动值或 `empty`=DHCP),不再污染主网络
+- **网络配置**:`DarwinConfigurator` 三处适配已验证——IPv4 point-to-point 延迟配置(`ifconfig utun inet LOCAL DEST`)、`0/1`+`128/1` split 覆盖 default、`-iface` link-direct 路由、FlushRoutes 删 split 恢复主网络
 - **已知差异**:macOS utun 不支持 `Close()` 后重建同名 adapter(每次创建新 utunN),relay lifecycle 可能需调整
+
+### macOS 适配改动(2026-07-12,待 Windows 回归验证)
+
+为在 macOS 跑通三阶段,本次改了 6 个文件。对 Windows 的影响分三类,**Windows 新会话须据此回归验证**:
+
+**① 对 Windows 无运行时影响(平台隔离)**:
+- `third_party/quectel-qmi-go/netcfg/darwin.go`:DarwinConfigurator 的 SetIPAddress/AddDefaultRoute/FlushRoutes 改动。darwin.go 无 build tag(全平台编译),但 Windows 走 `factory_windows.go` 的 WindowsConfigurator,**不调用** DarwinConfigurator,改了等于没改
+- `cmd/qmidial/dns.go`:`dnsRestore`/`restoreDNS` 只在 `configureDNSDarwin` 设置;Windows 走 `configureDNSWindows`(netsh,**未改**)。cleanup 调 `restoreDNS()` 时 Windows 上 `dnsRestore=nil` → no-op
+- `cmd/qmidial/main.go`:抽出的 `allowICMPFirewall()`/`setInterfaceMetric()`/`nullDevice()` 在 Windows 上跑**原封不动的 netsh 命令**(`if runtime.GOOS != "windows" { return }` 守卫,Windows 分支逻辑与原代码逐行一致)
+
+**② Windows 等价,但依赖 Tera 渲染**:
+- `.mise.toml`:`os()=="windows"` 时渲染成**原来的精确值**(`C:\msys64\mingw64\bin` / CC / PKG_CONFIG_PATH)。逻辑等价,但改用 Tera `{% if %}` 块——需 Windows mise 正确渲染(mise `os()` 在 Windows 返回 `"windows"`,标准行为,低风险)。**Windows 验证点**:`mise exec -- go env CC` 应为 `C:\msys64\mingw64\bin\gcc.exe`,且 `go build ./...` 通过
+
+**③ ⚠️ 唯一行为改变:`internal/usbtransport/usbtransport.go` 单例 context**:
+- 原来:每次 `Open` 新建 `gousb.NewContext()`,`Close` 关闭 context
+- 现在:进程级共享 context(`sharedContext` + `sync.Once`),`Close` 不关 context(只关 device/config/iface)
+- 原因:macOS 上 gousb 反复 `libusb_init`/exit 第二次 panic(LIBUSB_ERROR_OTHER -99),单例避免反复 init/exit
+- **对 Windows**:改变了 context 生命周期。共享 context 是 gousb 推荐用法,理论兼容,但 **Windows 的 WinUSB 反复 open/close 同一设备接口未实测**。"Windows 同样受益"是推断,未验证
+- **Windows 回归验证清单**:
+  1. `mise exec -- go run ./cmd/attest/`(单次 Open——验证单例 context 基本工作)
+  2. `mise exec -- go test -tags=hardware -run 'TestHardwareDeviceInfo|TestHardwareSMS' ./internal/usbtransport/`(连续多次 Open/Close——验证共享 context 下反复 claim MI_02 不出问题)
+  3. 若失败,回退方案:`sharedContext` 内加 `if runtime.GOOS != "darwin"` 分支保留 Windows 原行为(每次新 context + Close 关 context),仅 darwin 用单例
 
 ### 目录结构
 
@@ -129,21 +161,31 @@ GOPATH = "{{ config_root }}/.gopath"
 # Force `go install` into GOPATH/bin (overriding mise's GOBIN default that
 # points into the Go install dir, which gets wiped on version bumps).
 GOBIN = ""
-# _.path order matters: .gopath/bin first (so gopls/dlv/staticcheck resolve
-# before anything the parent shell injects), then mingw64/bin for gcc.
+# Windows-only CGO toolchain for gousb (libusb cgo binding):
+#   - mingw64 gcc on PATH (also ships libusb-1.0.dll at runtime)
+#   - CC pinned to mingw64 gcc (git bash otherwise injects MSYS2's /usr/bin/gcc)
+#   - PKG_CONFIG_PATH so cgo finds mingw64 libusb-1.0.pc
+# macOS uses homebrew clang (go's default CC) + brew pkg-config defaults,
+# so these are left empty on non-Windows. Verified: `go build ./...` passes
+# on darwin/arm64 with brew libusb 1.0.29 + pkgconf 2.4.3, no overrides needed.
 _.path = [
     "{{ config_root }}/.gopath/bin",
-    "C:\\msys64\\mingw64\\bin",
+    '{% if os() == "windows" %}C:\msys64\mingw64\bin{% else %}{% endif %}',
 ]
-CC = "C:\\msys64\\mingw64\\bin\\gcc.exe"
-PKG_CONFIG_PATH = "C:\\msys64\\mingw64\\lib\\pkgconfig"
+CC = '{% if os() == "windows" %}C:\msys64\mingw64\bin\gcc.exe{% else %}{% endif %}'
+PKG_CONFIG_PATH = '{% if os() == "windows" %}C:\msys64\mingw64\lib\pkgconfig{% else %}{% endif %}'
 ```
 
 ### 关键约定 / 踩坑记录
 
-- **Go 版本**:`go = "latest"`,截至 2026-07-11 解析为 go1.26.1 windows/amd64。
+- **Go 版本**:`go = "latest"`,解析为 go1.26.1（windows/amd64 + darwin/arm64 均已验证）。
 - **mise 信任**:新建/修改 `.mise.toml` 后需先 `mise trust` 才能 `mise install` / `mise exec`。
 - **运行 Go 命令**:统一用 `mise exec -- go <cmd>`(或在已激活 mise 的 shell 中直接 `go <cmd>`)。
+- **macOS 工具链**(darwin,2026-07-12 验证):CGO 工具链零配置——`go build ./...`、`go vet ./...`、`go test ./...` 全通过。
+  - 依赖:`brew install libusb pkg-config`(实测 libusb 1.0.29 + pkgconf 2.4.3)。
+  - go 默认 `CC=clang`、`PKG_CONFIG_PATH` 留空(brew pkg-config 默认搜索路径已含 libusb-1.0.pc)。
+  - `.mise.toml` 用 Tera `os()` 条件:Windows 设 mingw64 CC/PKG_CONFIG_PATH,macOS/其他留空。
+  - **Tera 语法坑**:`{{ ... if ... else ... }}` 在 `{{}}` 表达式内非法(报 "expected or/and/..."),必须用 `{% if %}...{% else %}{% endif %}` 块语句;Windows 路径反斜杠用 TOML 单引号 raw 串(`'...'`)包裹以避免转义地狱。
 - **mingw64 gcc 接入**:为支持 CGO(如 SQLite 驱动),接入 `C:\msys64\mingw64\bin\gcc.exe`(16.1.0)。
   - `_.path` 把 mingw64/bin 前置到 PATH。
   - **`CC` 必须显式锁定为绝对路径**:git bash 会把 MSYS2 的 `/c/msys64/usr/bin/gcc`(15.2.0)注入 PATH 且排在 `_.path` 前面,导致 `which gcc` 命中的是错的那个。设置 `CC` 后 CGO 编译器确定,不受 PATH 顺序干扰。
@@ -192,7 +234,7 @@ mise exec -- go env GOROOT GOPATH
 {
   // VSCode / ZCode settings.json
   "go.goroot": "<mise exec -- go env GOROOT 的输出>",
-  "go.gopath": "C:\\Users\\reamd\\Documents\\experiment_area\\vohive-release\\dji-modem-research\\.gopath",
+  "go.gopath": "C:\\Users\\<Win用户名>\\Documents\\experiment_area\\vohive-release\\dji-modem-research\\.gopath",
   "go.useLanguageServer": true,
   "go.toolsManagement.autoUpdate": false  // 工具由 mise 管,别让插件自己装
 }
@@ -238,6 +280,7 @@ package usbtransport
 - 默认(CI、无硬件):`go test ./...` —— 只跑纯逻辑 + mock 测试
 - 有硬件时:`go test -tags=hardware ./...` —— 额外跑设备集成测试
 - `cmd/` 下的 `usbprobe` / `attest` 本身就是硬件验证工具,不在 `go test` 范围(是 `go run`)
+- **`.env` 自动加载**:hardware 测试包均有 `hwenv_test.go`,其 `init()` 调 `testutil.LoadDotEnv(".env")`——读取项目根 `.env` 并 `os.Setenv`(**向上查找父目录**,shell 已设变量优先不覆盖)。故 `go test -tags=hardware` 无需手动 export 即可拿到 `DJI_TEST_SMS_RECIPIENT`/`DJI_TEST_APN` 等;`Send` 测试因 `.env` 有 recipient 会**真实发送短信**(花钱),只读测试不受影响
 
 ### Transport 可测性的接口设计
 

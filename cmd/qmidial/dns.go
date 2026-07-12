@@ -4,7 +4,14 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
 )
+
+// dnsRestore holds the platform-specific DNS restore function, set by
+// configureDNS on macOS (where DNS is written to a shared network service)
+// and invoked by restoreDNS on disconnect, so the main network's DNS isn't
+// left pointing at the 4G carrier DNS (unreachable over Wi-Fi).
+var dnsRestore func()
 
 // configureDNS sets DNS servers on the TUN interface.
 // netcfg.UpdateDNS is broken on Windows (error stub) and macOS (no-op),
@@ -19,6 +26,15 @@ func configureDNS(tunName, dns1, dns2 string) error {
 		return configureDNSLinux(tunName, dns1, dns2)
 	default:
 		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+	}
+}
+
+// restoreDNS reverts the DNS changes made by configureDNS (macOS). No-op when
+// no DNS was configured (e.g. non-TUN mode or non-darwin).
+func restoreDNS() {
+	if dnsRestore != nil {
+		dnsRestore()
+		dnsRestore = nil
 	}
 }
 
@@ -40,15 +56,30 @@ func configureDNSWindows(tunName, dns1, dns2 string) error {
 }
 
 func configureDNSDarwin(tunName, dns1, dns2 string) error {
-	// macOS: networksetup -setdnsservers <service> <dns1> <dns2>
-	// The network service name is typically not the interface name.
-	// We try common service names.
+	// macOS networksetup targets a "network service" (e.g. Wi-Fi/Ethernet),
+	// not the utun interface — setting DNS here overrides the main network's
+	// resolver. Snapshot the original first and register a restore, so the
+	// main network's DNS isn't left polluted with the 4G carrier DNS after
+	// disconnect. Restore: put back the original servers, or "empty" (= DHCP).
 	services := []string{"Ethernet", "Wi-Fi", "USB 10/100/1000 LAN"}
 	for _, svc := range services {
-		err := exec.Command("networksetup", "-setdnsservers", svc, dns1, dns2).Run()
-		if err == nil {
-			return nil
+		origOut, _ := exec.Command("networksetup", "-getdnsservers", svc).Output()
+		orig := strings.TrimSpace(string(origOut))
+		anySet := orig != "" && !strings.Contains(orig, "There aren't any DNS servers")
+		if err := exec.Command("networksetup", "-setdnsservers", svc, dns1, dns2).Run(); err != nil {
+			continue
 		}
+		// Capture per-iteration values for the closure.
+		svcName, wasAny, origVals := svc, anySet, orig
+		dnsRestore = func() {
+			if wasAny {
+				args := append([]string{"-setdnsservers", svcName}, strings.Fields(origVals)...)
+				exec.Command("networksetup", args...).Run()
+			} else {
+				exec.Command("networksetup", "-setdnsservers", svcName, "empty").Run()
+			}
+		}
+		return nil
 	}
 	return fmt.Errorf("could not set DNS on any known network service")
 }

@@ -8,13 +8,16 @@ GOPATH = "{{ config_root }}/.gopath"
 # Force `go install` into GOPATH/bin (overriding mise's GOBIN default that
 # points into the Go install dir, which gets wiped on version bumps).
 GOBIN = ""
-# Make mingw64's gcc available for CGO (e.g. SQLite drivers).
-# _.path order matters: put .gopath/bin first so `gopls` etc. resolve before
-# anything the parent shell injects; then mingw64/bin for gcc.
+# Windows-only CGO toolchain for gousb (libusb cgo binding):
+#   - mingw64 gcc on PATH (also ships libusb-1.0.dll at runtime)
+#   - CC pinned to mingw64 gcc (git bash otherwise injects MSYS2's /usr/bin/gcc)
+#   - PKG_CONFIG_PATH so cgo finds mingw64 libusb-1.0.pc
+# macOS uses homebrew clang (go's default CC) + brew pkg-config defaults,
+# so these are left empty on non-Windows. Verified: `go build ./...` passes
+# on darwin/arm64 with brew libusb 1.0.29 + pkgconf 2.4.3, no overrides needed.
 _.path = [
     "{{ config_root }}/.gopath/bin",
-    "C:\\msys64\\mingw64\\bin",
+    '{% if os() == "windows" %}C:\msys64\mingw64\bin{% else %}{% endif %}',
 ]
-CC = "C:\\msys64\\mingw64\\bin\\gcc.exe"
-# Let cgo's pkg-config find mingw64 libraries (libusb-1.0, etc.)
-PKG_CONFIG_PATH = "C:\\msys64\\mingw64\\lib\\pkgconfig"
+CC = '{% if os() == "windows" %}C:\msys64\mingw64\bin\gcc.exe{% else %}{% endif %}'
+PKG_CONFIG_PATH = '{% if os() == "windows" %}C:\msys64\mingw64\lib\pkgconfig{% else %}{% endif %}'
