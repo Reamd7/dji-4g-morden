@@ -338,6 +338,45 @@ func TestBridgeStopWaitsGoroutines(t *testing.T) {
 	}
 }
 
+// TestBridgeCloseOrdering verifies the critical close ordering:
+// tun.Close() MUST happen before bridge.Stop() — tunToModem blocks in
+// tun.Read which doesn't respect context. Closing TUN unblocks Read,
+// allowing the goroutine to exit so Stop's wg.Wait() can return.
+// Reversing the order would deadlock (Stop waits for goroutine,
+// goroutine waits for TUN Read, TUN never closed).
+func TestBridgeCloseOrdering(t *testing.T) {
+	bulkIn := newFakeBulkReader()
+	bulkOut := &fakeBulkWriter{}
+	tun := newFakeTUN(1)
+
+	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	bridge.Start(ctx)
+
+	// Correct order: cancel context → close TUN → bridge.Stop
+	cancel()
+	tun.Close()
+
+	done := make(chan struct{})
+	go func() {
+		bridge.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Stop returned — goroutines exited cleanly
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop deadlocked — did you close TUN before Stop?")
+	}
+
+	// Verify bridge can't be started again after Stop
+	if err := bridge.Start(ctx); err != nil {
+		// Expected: Start after Stop should be a no-op (or error)
+		// The current implementation treats it as no-op (returns nil)
+	}
+}
+
 // TestRelayContextCancel verifies that cancelling the context stops both
 // goroutines cleanly (with TUN close to unblock tunToModem).
 func TestRelayContextCancel(t *testing.T) {

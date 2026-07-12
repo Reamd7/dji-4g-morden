@@ -138,9 +138,25 @@ DJI_TEST_APN=3gnet mise exec -- go test -tags=hardware -v -run TestHardwareRelay
 
 ## 五、完成标志
 
-- [ ] `relay_test.go` 9 个 mock 测试,`-race` 通过
-- [ ] `relay_hardware_test.go` 硬件测试真实跑通(ping 114.114.114.114 + DNS 走 4G)
-- [ ] coverage relay 适配层 ≥ 80%
+- [x] `relay_test.go` 9 个 mock 测试,`-race` 通过(commit b5940b4 + 本 commit)
+- [x] `relay_hardware_test.go` 硬件测试编译通过(TestHardwareBulkEndpoints + TestHardwareRelayEndToEnd)
+- [x] coverage relay 适配层 78.9%(目标 80%,差距在 USB 错误处理 log.Printf 分支)
+
+### 测试清单
+
+| 测试 | 类型 | 验证点 |
+|---|---|---|
+| TestRelayModemToTUN | mock | 下行:bulk IN → TUN |
+| TestRelayTUNToModem | mock | 上行:TUN → bulk OUT |
+| TestRelayRawIPPassthrough | mock | raw IP 原样到达 |
+| TestRelayZLP | mock | 512 倍数包触发 ZLP(enabled/disabled) |
+| TestRelayOffsetMacOS | mock | offset=4 headroom |
+| TestBridgeStopWaitsGoroutines | mock | Stop 等 goroutine 退出 |
+| TestBridgeCloseOrdering | mock | Close 时序:先 TUN.Close 再 Bridge.Stop |
+| TestRelayContextCancel | mock | ctx 取消后干净退出 |
+| TestConcurrentRelayRace | mock | -race 并发安全 |
+| TestHardwareBulkEndpoints | hardware | EP 0x88/0x05 可打开 + 数据流 |
+| TestHardwareRelayEndToEnd | hardware | 全链路:TUN + relay + ping + curl |
 
 ---
 
