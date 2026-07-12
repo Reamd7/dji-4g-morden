@@ -83,6 +83,15 @@ for {
 2. 然后从 bulk IN EP 0x88 读,看是否收到 ICMP echo reply
 3. 或者用 `ping` 命令(如果 TUN 已创建,但此探针不创建 TUN,所以用手动构造)
 
+#### Phase D2:ZLP 测试(R5 验证)
+
+手动构造一个 **恰好 512 字节**的 IP 包(padding ICMP payload),写入 bulk OUT EP 0x05,
+然后从 bulk IN EP 0x88 读。如果不追加 ZLP 也能收到 reply,说明 modem 不需要 ZLP。
+如果卡住,说明需要 ZLP(在 `tunToModem` 里加 0 字节 Write)。
+
+注意:Linux 驱动 `qmi_wwan_q.c` 对 EC25 设了 `FLAG_SEND_ZLP`,说明 modem 期望 ZLP。
+但 WinUSB 的行为可能与 Linux 不同。
+
 ### 2. `internal/qmitransport/bulkendpoints.go`
 
 QMITransport 新增方法,打开 bulk IN/OUT endpoints:
@@ -119,6 +128,8 @@ const (
 - [ ] WDS StartNetwork 成功(拿到 IP,与阶段 2 一致)
 - [ ] bulk IN EP 0x88 读到数据,且首字节 IP version = 4 或 6(**核心验证**)
 - [ ] 或:手动发 IP 包到 bulk OUT 0x05,从 bulk IN 0x88 收到响应(**回环验证**)
+- [ ] ZLP 测试:512 字节 IP 包无 ZLP 是否卡住(决定 relay 是否需要手动 ZLP)
+
 
 ## 风险
 

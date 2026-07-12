@@ -27,6 +27,16 @@
 4. **raw-IP 模式下,bulk EP 上是裸 IP 包**,无以太网头、无 QMUX 封装、无 QMAP 头。
    TUN 库也是 layer-3(IP only,无以太网头)。两者格式完全一致——直接中继即可。
 
+5. **Linux 驱动确认**(参考 `references/linux-driver/q_drivers/qmi_wwan/qmi_wwan_q.c`):
+   - EC25(0x2C7C:0x0125)匹配 `QMI_FIXED_RAWIP_INTF(0x2C7C, 0x0125, 4, mdm9x07)`
+   - `driver_info = qmi_wwan_raw_ip_info_mdm9x07`,`.data = (5<<8)|4`(QMAPV1, 4KB)
+   - `.flags = FLAG_WWAN | FLAG_RX_ASSEMBLE | FLAG_NOARP | FLAG_SEND_ZLP`
+   - **默认 qmap_mode=0**(模块参数,无 QMAP)→ 走 `qmi_wwan_tx_fixup`/`qmi_wwan_rx_fixup`(raw-IP)
+   - **`FLAG_SEND_ZLP`**:TX URB 长度是 maxPacketSize(512B)整数倍时,内核自动追加 ZLP
+   - RX:`rx_urb_size = 1520`(1500+14+6),非 512 倍数,无 ZLP 问题
+   - DTR 在 `bind()` 中设置(`0x22, 0x21, wValue=1, wIndex=ifaceNum`)——印证阶段 2 Phase 0 发现
+   - QMAP 头格式(降级参考):`struct qmap_hdr { u8 pad; u8 mux_id; u16 pkt_len; }`(4 字节,大端)
+
 ## 头号风险
 
 ### R1: bulk EP 是否真的承载 IP 数据(**MEDIUM-HIGH**)
@@ -58,6 +68,20 @@ modem 需要发 ZLP(Zero Length Packet)表示结束。多数 modem 正确处理,
 
 **缓解**:使用足够大的 read buffer(65535),依赖 short packet 检测。如果有包粘连问题,
 切到固定 1600B buffer + 短读策略。
+
+### R5: TX 方向 ZLP(Zero Length Packet)(**MEDIUM**)
+
+Linux 驱动设了 `FLAG_SEND_ZLP`:当 TX URB 长度是 bulk OUT EP maxPacketSize(512B,USB 2.0)
+的整数倍时,内核自动追加 ZLP 告诉 modem"传输结束"。libusb/gousb **不自动发 ZLP**。
+如果 IP 包恰好是 512 或 1024 字节(不太常见但 TCP payload 可能命中),modem 可能
+等待更多数据导致包卡在缓冲区。
+
+**缓解**:
+1. 初始版本不做 ZLP,测试是否真的卡(多数 modem 有超时重发,不致命)
+2. 如果卡:`tunToModem` 在 `bulkOut.Write(pkt)` 后,如果 `len(pkt)%512==0`,再写一个
+   0 字节 `bulkOut.Write([]byte{})` 发 ZLP
+3. 注意:gousb v1.1.3 对 0 字节 Write 的行为未验证(可能拒绝或可能发 ZLP)。需要实测。
+4. WinUSB 的 ZLP 行为与 Linux libusb 可能不同,需跨平台验证。
 
 ## 数据通路架构
 
