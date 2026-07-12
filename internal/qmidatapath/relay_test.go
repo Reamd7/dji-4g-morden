@@ -448,6 +448,106 @@ func TestConcurrentRelayRace(t *testing.T) {
 	wg.Wait()
 }
 
+// TestRelayStats verifies packet counters after relay.
+func TestRelayStats(t *testing.T) {
+	bulkIn := newFakeBulkReader()
+	bulkOut := &fakeBulkWriter{}
+	tun := newFakeTUN(1)
+
+	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	bridge.Start(ctx)
+
+	// Push 3 TX packets
+	for i := 0; i < 3; i++ {
+		tun.rx <- makeIPv4Packet(64)
+	}
+	// Push 2 RX packets
+	for i := 0; i < 2; i++ {
+		bulkIn.pkts <- makeIPv4Packet(64)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	txPkt, txByt, rxPkt, rxByt := bridge.Stats()
+	if txPkt < 3 {
+		t.Errorf("TX packets=%d, want >=3", txPkt)
+	}
+	if rxPkt < 2 {
+		t.Errorf("RX packets=%d, want >=2", rxPkt)
+	}
+	if txByt <= 0 || rxByt <= 0 {
+		t.Errorf("bytes: TX=%d RX=%d, both should be >0", txByt, rxByt)
+	}
+
+	cancel()
+	tun.Close()
+	bridge.Stop()
+}
+
+// TestStartIdempotent verifies Start can be called twice without panic.
+func TestStartIdempotent(t *testing.T) {
+	bulkIn := newFakeBulkReader()
+	bulkOut := &fakeBulkWriter{}
+	tun := newFakeTUN(1)
+
+	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := bridge.Start(ctx); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	if err := bridge.Start(ctx); err != nil {
+		t.Fatalf("second Start: %v", err)
+	}
+
+	tun.Close()
+	bridge.Stop()
+}
+
+// TestStopWithoutStart verifies Stop is safe before Start.
+func TestStopWithoutStart(t *testing.T) {
+	bulkIn := newFakeBulkReader()
+	bulkOut := &fakeBulkWriter{}
+	tun := newFakeTUN(1)
+
+	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	bridge.Stop() // should be a no-op, no panic
+}
+
+// TestRelayBulkWriteError verifies the relay continues when bulkOut.Write fails.
+func TestRelayBulkWriteError(t *testing.T) {
+	bulkIn := newFakeBulkReader()
+	bulkOut := &errorBulkWriter{}
+	tun := newFakeTUN(1)
+
+	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	bridge.Start(ctx)
+
+	// Push a packet — bulkOut.Write will fail, relay should log and continue
+	tun.rx <- makeIPv4Packet(64)
+	time.Sleep(100 * time.Millisecond)
+
+	cancel()
+	tun.Close()
+	bridge.Stop()
+
+	// Verify relay didn't crash (Stats accessible)
+	txPkt, _, _, _ := bridge.Stats()
+	if txPkt < 1 {
+		t.Errorf("TX packets=%d, expected >=1 (counted before write error)", txPkt)
+	}
+}
+
+// errorBulkWriter always returns an error on Write.
+type errorBulkWriter struct{}
+
+func (e *errorBulkWriter) Write(buf []byte) (int, error) {
+	return 0, fmt.Errorf("simulated write error")
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 // makeIPv4Packet creates a minimal valid-ish IPv4 packet of the given total
