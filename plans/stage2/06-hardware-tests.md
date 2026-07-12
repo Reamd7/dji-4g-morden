@@ -51,15 +51,19 @@ mise exec -- go test -tags=hardware -race ./internal/qmitransport/
 
 ## 交付物 / 完成标志
 
-- [ ] `qmi_hardware_test.go` 覆盖上表用例
-- [ ] `-tags=hardware` 全部 PASS(含 -race)
-- [ ] `TestConcurrentCloseNoCrash` 0 segfault(issue/001 在 QMI 场景不重现)
-- [ ] 拨号拿到真实 IP(打印到测试日志)
+- [x] 硬件测试覆盖全部用例(7 个 hardware tests in 2 files)
+- [x] `-tags=hardware` 全部 PASS(18/18 = 7 硬件 + 11 离线)
+- [x] 并发 Close 0 segfault(TestHardwareConcurrentClose 10 轮 + TestHardwareConcurrentManagerClose 5 轮)
+- [x] 拨号拿到真实 IPv4 + IPv6(双栈验证)
 
-## 风险
+## 测试清单
 
-| 风险 | 缓解 |
-|---|---|
-| 测试改变模组状态(拨号/PDP 激活) | 测试后 StopNetworkInterface 清理;TestWDSStartNetwork 用 t.Cleanup |
-| SIM 未 PS attach | 测试前 Skip 检查;或先跑阶段 1 的 AT 确认 CGATT/CREG |
-| WinUSB 装错 Iface | 子计划 00 前置已确认;hardware test 失败先查 Zadig |
+| 文件 | 测试 | 类型 |
+|---|---|---|
+| `qmitransport_hardware_test.go` | TestHardwareOpenAndClose | Open/Close 生命周期 |
+| | TestHardwareSyncExchange | SYNC → SYNC_RESP |
+| | TestHardwareConcurrentClose | 10 轮并发 Close(transport 级) |
+| `manager_hardware_test.go` | TestHardwareManagerStartCore | service 分配(只读) |
+| | TestHardwareManagerDialup | IPv4 WDS 拨号 + PDH + IP |
+| | TestHardwareManagerDialupIPv6 | 双栈拨号(IPv4 + IPv6) |
+| | TestHardwareConcurrentManagerClose | 5 轮并发 manager Close(QMI 级) |
