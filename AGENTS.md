@@ -94,6 +94,16 @@
 - **Linux 驱动参考**:`references/linux-driver/q_drivers/qmi_wwan/qmi_wwan_q.c` 确认 EC25 默认 `qmap_mode=0`(raw-IP)、`FLAG_SEND_ZLP`、DTR 在 bind() 设置
 - **三阶段全部完成**:纯用户态 USB → AT+短信 → QMI 拨号 → TUN 上网,零内核驱动
 
+### 下一步:macOS 平台验证
+
+三阶段路线图在 **Windows 上全程跑通**(AT+短信+QMI拨号+TUN上网)。代码已设计为跨平台,但 macOS 尚未硬件验证。待办:
+
+- **USB transport**:macOS 无需 Zadig(libusb 原生支持),gousb 应直接工作。验证 AT transport(MI_02)+ QMI transport(MI_04 model B + DTR)
+- **TUN**:wireguard/tun 在 macOS 用 utun(内核层),relay 需 `offset=4`(utun 前缀 4 字节 AF-family)。`tunToModem`/`modemToTun` 已支持 offset 参数
+- **DNS**:`dns.go` 已有 macOS 分支(`networksetup -setdnsservers`),需实测
+- **网络配置**:manager netcfg 的 macOS 路径需验证(IP/路由/MTU)
+- **已知差异**:macOS utun 不支持 `Close()` 后重建同名 adapter(每次创建新 utunN),relay lifecycle 可能需调整
+
 ### 目录结构
 
 - `docs/` —— 调研报告(中文 markdown)
