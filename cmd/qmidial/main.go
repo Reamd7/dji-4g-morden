@@ -221,14 +221,25 @@ func main() {
 		// Verify connectivity
 		time.Sleep(2 * time.Second) // let relay stabilize
 
-		// Allow ICMP through Windows Firewall (Wintun adapter is "public" by default)
-		fmt.Println("  Adding Windows Firewall ICMP allow rule...")
+		// Debug: show routing table + interface metrics
+		fmt.Println("\n  === Routing table (IPv4) ===")
+		runCommand("route", "print", "0.0.0.0")
+		fmt.Println("  === Interface metrics ===")
+		runCommand("netsh", "interface", "ipv4", "show", "interfaces")
+
+		// Set qmi0 metric to 1 (lowest = highest priority) so traffic goes through TUN
+		fmt.Printf("  Setting %s metric=1...\n", tunName)
+		runCommand("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=1")
+
+		// Allow ICMP both directions through Windows Firewall
+		fmt.Println("  Adding Windows Firewall ICMP rules (out+in)...")
 		runCommand("netsh", "advfirewall", "firewall", "add", "rule",
-			"name=qmi-tun-icmp", "protocol=icmpv4:8,any", "dir=out", "action=allow")
+			"name=qmi-tun-icmp-out", "protocol=icmpv4:8,any", "dir=out", "action=allow")
+		runCommand("netsh", "advfirewall", "firewall", "add", "rule",
+			"name=qmi-tun-icmp-in", "protocol=icmpv4:0,any", "dir=in", "action=allow")
 
 		fmt.Println("  Testing ping 114.114.114.114 through TUN...")
 		runCommand("ping", platformPingArgs("114.114.114.114")...)
-		// Also try source-bound ping (force through TUN IP)
 		if s := mgr.Settings(); s != nil && len(s.IPv4Address) > 0 {
 			fmt.Printf("  Testing ping -S %s 114.114.114.114...\n", s.IPv4Address)
 			runCommand("ping", platformPingArgsWithSource("114.114.114.114", s.IPv4Address.String())...)
@@ -239,6 +250,11 @@ func main() {
 		runCommand("curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}s", "http://www.baidu.com")
 
 		// Tests done — auto-exit (cleanup follows)
+		// Print relay stats
+		txPkt, txByt, rxPkt, rxByt := bridge.Stats()
+		fmt.Printf("\n  Relay stats: TX %d pkts/%d bytes, RX %d pkts/%d bytes\n",
+			txPkt, txByt, rxPkt, rxByt)
+
 		fmt.Println("\n  Tests complete. Disconnecting...")
 	} else {
 		// Non-TUN mode: hold for 5s then exit (stage 2 behavior)

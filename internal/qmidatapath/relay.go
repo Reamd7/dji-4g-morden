@@ -31,6 +31,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"sync/atomic"
 )
 
 // BulkReader abstracts the gousb IN endpoint (EP 0x88) so relay logic can be
@@ -73,6 +74,17 @@ type Bridge struct {
 	wg      sync.WaitGroup
 	mu      sync.Mutex
 	started bool
+
+	// Packet counters (atomic, for debugging)
+	txPackets atomic.Int64 // TUN → modem (uplink)
+	txBytes   atomic.Int64
+	rxPackets atomic.Int64 // modem → TUN (downlink)
+	rxBytes   atomic.Int64
+}
+
+// Stats returns relay packet counters.
+func (b *Bridge) Stats() (txPkt, txByt, rxPkt, rxByt int64) {
+	return b.txPackets.Load(), b.txBytes.Load(), b.rxPackets.Load(), b.rxBytes.Load()
 }
 
 // New creates a Bridge. tun/bulkIn/bulkOut must be pre-opened by the caller.
@@ -163,6 +175,8 @@ func (b *Bridge) tunToModem(ctx context.Context) {
 
 		for i := 0; i < n; i++ {
 			pkt := bufs[i][b.offset : b.offset+sizes[i]]
+			b.txPackets.Add(1)
+			b.txBytes.Add(int64(len(pkt)))
 			if _, err := b.bulkOut.Write(pkt); err != nil {
 				if ctx.Err() != nil {
 					return
@@ -208,6 +222,8 @@ func (b *Bridge) modemToTun(ctx context.Context) {
 		if n == 0 {
 			continue
 		}
+		b.rxPackets.Add(1)
+		b.rxBytes.Add(int64(n))
 
 		// raw-IP: buf[:n] is a bare IP packet. Copy into outBuf with offset
 		// headroom for the TUN's protocol prefix (macOS utun needs 4 bytes).
