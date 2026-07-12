@@ -104,37 +104,52 @@
 - TUN 上网(阶段 3):`qmidial -dial -tun` 端到端跑通——curl http://www.baidu.com HTTP 200(0.287s)、curl --interface <IPv4> HTTP 200(0.082s)、ping baidu.com 61-78ms、nslookup 经 4G DNS `<DNS1>` 解析成功(4 IP)。relay TX 1384 pkts/230KB + RX 1079 pkts/372KB(真实双向数据)。**三阶段在 macOS 全部闭环,零内核驱动**
 - **DarwinConfigurator 修复(macOS netcfg)**:`third_party/quectel-qmi-go/netcfg/darwin.go` 三处适配——(1) `SetIPAddress` IPv4 延迟到 `AddDefaultRoute`:utun 是 point-to-point 且无主地址,`inet alias` 与纯 `inet IP/PREFIX` 均失败(utun 只配得上 inet6),改为记 v4addr,在 AddDefaultRoute 用 `ifconfig utun inet LOCAL DEST`(point-to-point,dest=gateway);(2) `AddDefaultRoute` 用 `0/1`+`128/1` split 覆盖 default:macOS 已有 en0 的 default 路由,`route add default` 报 "File exists" 静默失败,split 比 default 更具体且不动现有路由,FlushRoutes 删除即可恢复;(3) 路由用 `-iface`(link-direct,point-to-point 无需 ARP gateway)
 
-### 下一步:macOS 平台验证
+### 下一步:TUN + netstack 双数据后端(2026-07-13 规划)
 
-三阶段路线图在 **Windows + macOS 上全程跑通**(AT+短信+QMI拨号+TUN 上网,零内核驱动)。代码已设计为跨平台。**macOS(2026-07-12,darwin/arm64)三阶段全部验证通过**:AT 通路 + 短信收发 + QMI(SYNC + 拨号 IPv4+IPv6 双栈)+ TUN 上网(curl HTTP 200/ping 61-78ms/DNS 解析)。brew libusb + 默认 clang,无需 Zadig/无需卸内核驱动。
+三阶段路线图在 **Windows + macOS 上全程跑通**(AT+短信+QMI拨号+TUN上网,零内核驱动)。macOS(darwin/arm64)三阶段全部验证通过(brew libusb + 默认 clang,无需 Zadig/无需卸内核驱动)。
 
-- **USB transport**:macOS 无需 Zadig(libusb 原生支持),gousb 直接 claim 成功(5 接口均 `class=0xFF` vendor-specific,AppleUSBACM 不匹配,无内核驱动抢占)。✅ AT transport(MI_02);✅ QMI transport(MI_04 模型 B + DTR);✅ TUN 上网
-- **TUN**:wireguard/tun macOS utun,relay `offset=4` ✅ 已验证(utun 4 字节 AF-family 前缀,wireguard/tun Read/Write `offset-4:` 语义匹配)
-- **DNS**:`configureDNSDarwin`(`networksetup`)把运营商 DNS 配到主网络服务(Wi-Fi/Ethernet)——macOS 限制:utun 无 networksetup 管理的 Network Service,不能直接给 utun 配 DNS;DNS 解析又是全局的,所以临时借主网络服务设 4G DNS。经 split 路由走 utun9 → 4G 解析成功(`<DNS1>` nslookup 验证)。**退出自动恢复**:`configureDNSDarwin` 先 `networksetup -getdnsservers` 快照原值并注册 `dnsRestore` 闭包,cleanup 调 `restoreDNS()` 还原(原手动值或 `empty`=DHCP),不再污染主网络
-- **网络配置**:`DarwinConfigurator` 三处适配已验证——IPv4 point-to-point 延迟配置(`ifconfig utun inet LOCAL DEST`)、`0/1`+`128/1` split 覆盖 default、`-iface` link-direct 路由、FlushRoutes 删 split 恢复主网络
-- **已知差异**:macOS utun 不支持 `Close()` 后重建同名 adapter(每次创建新 utunN),relay lifecycle 可能需调整
+**macOS 适配改动(2026-07-12)已完成并 Windows 回归验证通过**:
+- `.mise.toml` Tera `os()` 条件;`usbtransport` 单例 context;`netcfg/darwin` point-to-point IPv4 + split 路由;`qmidial` 平台适配;`dns.go` DNS restore;`.githooks/pre-commit` 跨平台
 
-### macOS 适配改动(2026-07-12,待 Windows 回归验证)
+**新方向:引入 gVisor netstack 作为 TUN 的替代数据后端。** 调研结论见 `docs/performance/02-tun-alternatives.md`。核心思路:
 
-为在 macOS 跑通三阶段,本次改了 6 个文件。对 Windows 的影响分三类,**Windows 新会话须据此回归验证**:
+```
+方案 1(-tun):     App → OS TCP/IP → TUN → relay → USB → modem    (已有,需 admin,透明)
+方案 2(-socks5):  App → SOCKS5 → netstack → channel → USB → modem  (新增,无需 admin,需配代理)
+```
 
-**① 对 Windows 无运行时影响(平台隔离)**:
-- `third_party/quectel-qmi-go/netcfg/darwin.go`:DarwinConfigurator 的 SetIPAddress/AddDefaultRoute/FlushRoutes 改动。darwin.go 无 build tag(全平台编译),但 Windows 走 `factory_windows.go` 的 WindowsConfigurator,**不调用** DarwinConfigurator,改了等于没改
-- `cmd/qmidial/dns.go`:`dnsRestore`/`restoreDNS` 只在 `configureDNSDarwin` 设置;Windows 走 `configureDNSWindows`(netsh,**未改**)。cleanup 调 `restoreDNS()` 时 Windows 上 `dnsRestore=nil` → no-op
-- `cmd/qmidial/main.go`:抽出的 `allowICMPFirewall()`/`setInterfaceMetric()`/`nullDevice()` 在 Windows 上跑**原封不动的 netsh 命令**(`if runtime.GOOS != "windows" { return }` 守卫,Windows 分支逻辑与原代码逐行一致)
+两个后端共享同一个 QMI transport + datapath,通过 `DataSink` 接口切换:
 
-**② Windows 等价,但依赖 Tera 渲染**:
-- `.mise.toml`:`os()=="windows"` 时渲染成**原来的精确值**(`C:\msys64\mingw64\bin` / CC / PKG_CONFIG_PATH)。逻辑等价,但改用 Tera `{% if %}` 块——需 Windows mise 正确渲染(mise `os()` 在 Windows 返回 `"windows"`,标准行为,低风险)。**Windows 验证点**:`mise exec -- go env CC` 应为 `C:\msys64\mingw64\bin\gcc.exe`,且 `go build ./...` 通过
+```go
+type DataSink interface {
+    InjectPacket(pkt []byte) error  // modem → 后端
+    ReadPacket() ([]byte, error)    // 后端 → modem
+    Close() error
+}
+```
 
-**③ ⚠️ 唯一行为改变:`internal/usbtransport/usbtransport.go` 单例 context**:
-- 原来:每次 `Open` 新建 `gousb.NewContext()`,`Close` 关闭 context
-- 现在:进程级共享 context(`sharedContext` + `sync.Once`),`Close` 不关 context(只关 device/config/iface)
-- 原因:macOS 上 gousb 反复 `libusb_init`/exit 第二次 panic(LIBUSB_ERROR_OTHER -99),单例避免反复 init/exit
-- **对 Windows**:改变了 context 生命周期。共享 context 是 gousb 推荐用法,理论兼容,但 **Windows 的 WinUSB 反复 open/close 同一设备接口未实测**。"Windows 同样受益"是推断,未验证
-- **Windows 回归验证清单**:
-  1. `mise exec -- go run ./cmd/attest/`(单次 Open——验证单例 context 基本工作)
-  2. `mise exec -- go test -tags=hardware -run 'TestHardwareDeviceInfo|TestHardwareSMS' ./internal/usbtransport/`(连续多次 Open/Close——验证共享 context 下反复 claim MI_02 不出问题)
-  3. 若失败,回退方案:`sharedContext` 内加 `if runtime.GOOS != "darwin"` 分支保留 Windows 原行为(每次新 context + Close 关 context),仅 darwin 用单例
+- **TUN 后端**(已有):全系统透明上网,需要 admin
+- **netstack + SOCKS5 后端**(新增):纯 Go 用户态 TCP/IP,无需 admin,支持多设备负载均衡
+
+**netstack 方案的核心价值**:
+- 无需 admin、无需 TUN、无需改路由表——macOS 开发场景不再 sudo
+- 纯 Go,零平台特异代码——跨平台完全统一
+- 多设备杀手级用例:N 个模块 → N 个 netstack → N 个 SOCKS5 端口或单端口负载均衡/轮换
+- 天然隔离,不影响主网络
+
+**gVisor netstack**(`gvisor.dev/gvisor/pkg/tcpip`):Google 纯 Go 用户态 TCP/IP 栈,link layer 支持 Go channel(不是 TUN)。文档:https://gvisor.dev/docs/architecture_guide/networking/
+
+**实施路线**:
+1. 抽象 `DataSink` 接口,重构现有 relay 对接
+2. 导入 gVisor netstack,创建 channel link endpoint
+3. SOCKS5 server(`armon/go-socks5` 或手写)
+4. DNS 解析(netstack 内置或 114.114.114.114)
+5. 多设备支持(按 USB serial 枚举全部模块,各自独立 netstack 实例)
+
+**相关调研文档**:
+- `docs/performance/01-qcusbwwan-reverse-engineering.md` — 官方驱动逆向 + QMAP/韧性/异步等可迁移设计思想
+- `docs/performance/02-tun-alternatives.md` — TUN 替代方案对比 + 多设备场景分析
+- `docs/11-quectel-driver-mbb-mechanism.md` — 官方驱动「移动数据」面板机制(IF_TYPE_WWANPP)
 
 ### 目录结构
 
