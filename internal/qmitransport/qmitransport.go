@@ -277,11 +277,15 @@ func (t *QMITransport) Read(buf []byte) (int, error) {
 		if t.closed {
 			return 0, errClosed
 		}
-		n, err := t.ctrl.Control(bmReqClassIn, reqGetEncap, 0x0000, uint16(t.ifaceNum), buf)
+		// Use a dedicated buffer — WinUSB rejects the 16KB buffer that
+		// readLoop passes (libusb: invalid param). qmiprobe confirmed
+		// 2048 bytes works. QMUX frames are < 1500 bytes (IP MTU).
+		resp := make([]byte, 2048)
+		n, err := t.ctrl.Control(bmReqClassIn, reqGetEncap, 0x0000, uint16(t.ifaceNum), resp)
 		if err != nil {
-			return n, fmt.Errorf("qmitransport: GET_ENCAPSULATED_RESPONSE: %w", err)
+			return 0, fmt.Errorf("qmitransport: GET_ENCAPSULATED_RESPONSE: %w", err)
 		}
-		return n, nil
+		return copy(buf, resp[:n]), nil
 
 	case <-timerC:
 		return 0, errTimeout{}

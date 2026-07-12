@@ -47,6 +47,15 @@ func main() {
 	// 2. QMI client (SyncOnOpen sends CTL SYNC internally)
 	fmt.Println("[2/6] Creating QMI client (NewClientFromTransport + SyncOnOpen)...")
 	clientOpts := qmi.DefaultClientOptions()
+	clientOpts.Logf = func(level qmi.ClientLogLevel, format string, args ...any) {
+		prefix := "DEBUG"
+		if level == qmi.ClientLogLevelWarn {
+			prefix = "WARN"
+		} else if level == qmi.ClientLogLevelError {
+			prefix = "ERROR"
+		}
+		fmt.Printf("  [qmi:%s] %s\n", prefix, fmt.Sprintf(format, args...))
+	}
 	client, err := qmi.NewClientFromTransport(ctx, transport, clientOpts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "NewClientFromTransport failed: %v\n", err)
@@ -59,13 +68,17 @@ func main() {
 	cfg := manager.Config{
 		APN:        *apn,
 		EnableIPv4: true,
+		Timeouts: manager.TimeoutConfig{
+			IndicationRegister: 15 * time.Second,
+			Init:               30 * time.Second,
+		},
 	}
 	mgr := manager.NewWithClient(cfg, nil, client)
 	fmt.Println("      OK — hook set, client injected")
 
 	// 4. Start core (allocate CTL/WDA/WDS/NAS/DMS/UIM services)
 	fmt.Println("[4/6] Starting manager core (service allocation)...")
-	startCtx, startCancel := context.WithTimeout(ctx, 30*time.Second)
+	startCtx, startCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer startCancel()
 	if err := mgr.StartCoreContext(startCtx); err != nil {
 		fmt.Fprintf(os.Stderr, "StartCore failed: %v\n", err)
@@ -74,6 +87,9 @@ func main() {
 	}
 	defer mgr.Stop()
 	fmt.Println("      OK — all QMI services allocated (NAS/DMS/UIM/WDA/WDS)")
+
+	// Wait for async PreWarmIdentities to populate the snapshot.
+	time.Sleep(3 * time.Second)
 
 	// 5. Device info (read-only — safe for SIM)
 	fmt.Println("[5/6] Querying device info (read-only)...")
@@ -105,11 +121,21 @@ func printDeviceInfo(mgr *manager.Manager) {
 	snap := mgr.GetDeviceSnapshot()
 
 	if ids, ok := snap.Identities(); ok {
-		fmt.Printf("      Model:    %s\n", ids.Model)
-		fmt.Printf("      Firmware: %s\n", ids.FirmwareRevision)
-		fmt.Printf("      IMEI:     %s\n", ids.IMEI)
-		fmt.Printf("      IMSI:     %s\n", ids.IMSI)
-		fmt.Printf("      ICCID:    %s\n", ids.ICCID)
+		if ids.Model != "" {
+			fmt.Printf("      Model:    %s\n", ids.Model)
+		}
+		if ids.FirmwareRevision != "" {
+			fmt.Printf("      Firmware: %s\n", ids.FirmwareRevision)
+		}
+		if ids.IMEI != "" {
+			fmt.Printf("      IMEI:     %s\n", ids.IMEI)
+		}
+		if ids.IMSI != "" {
+			fmt.Printf("      IMSI:     %s\n", ids.IMSI)
+		}
+		if ids.ICCID != "" {
+			fmt.Printf("      ICCID:    %s\n", ids.ICCID)
+		}
 	}
 
 	if sig, _ := snap.Signal(); sig != nil {
@@ -117,7 +143,9 @@ func printDeviceInfo(mgr *manager.Manager) {
 	}
 
 	if opName, _, ok := snap.NASOperatorName(); ok && opName != nil {
-		fmt.Printf("      Operator: %s\n", opName.ServiceProviderName)
+		if opName.ServiceProviderName != "" {
+			fmt.Printf("      Operator: %s\n", opName.ServiceProviderName)
+		}
 	}
 }
 
