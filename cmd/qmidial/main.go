@@ -25,9 +25,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"runtime"
-	"syscall"
 	"time"
 
 	"golang.zx2c4.com/wireguard/tun"
@@ -35,6 +33,7 @@ import (
 	"dji-modem-research/internal/qmidatapath"
 	"dji-modem-research/internal/qmitransport"
 	"dji-modem-research/third_party/quectel-qmi-go/manager"
+	"dji-modem-research/third_party/quectel-qmi-go/netcfg"
 	"dji-modem-research/third_party/quectel-qmi-go/qmi"
 )
 
@@ -211,19 +210,36 @@ func main() {
 				fmt.Println("      OK — DNS configured")
 			}
 		}
+		// Fix routing: TUN is point-to-point, needs direct route (not gateway)
+		fmt.Printf("      Adding direct default route via %s...\n", tunName)
+		if err := netcfg.AddDefaultRouteDirect(tunName, false); err != nil {
+			fmt.Printf("      warn: AddDefaultRouteDirect: %v\n", err)
+		} else {
+			fmt.Println("      OK — default route added (direct, no gateway)")
+		}
 
-		// Verify connectivity — actual ping + DNS resolution through the TUN
+		// Verify connectivity
 		time.Sleep(2 * time.Second) // let relay stabilize
-		fmt.Println("\n  Testing ping 114.114.114.114 through TUN...")
+
+		// Allow ICMP through Windows Firewall (Wintun adapter is "public" by default)
+		fmt.Println("  Adding Windows Firewall ICMP allow rule...")
+		runCommand("netsh", "advfirewall", "firewall", "add", "rule",
+			"name=qmi-tun-icmp", "protocol=icmpv4:8,any", "dir=out", "action=allow")
+
+		fmt.Println("  Testing ping 114.114.114.114 through TUN...")
 		runCommand("ping", platformPingArgs("114.114.114.114")...)
+		// Also try source-bound ping (force through TUN IP)
+		if s := mgr.Settings(); s != nil && len(s.IPv4Address) > 0 {
+			fmt.Printf("  Testing ping -S %s 114.114.114.114...\n", s.IPv4Address)
+			runCommand("ping", platformPingArgsWithSource("114.114.114.114", s.IPv4Address.String())...)
+		}
 		fmt.Println("  Testing DNS resolution (nslookup baidu.com)...")
 		runCommand("nslookup", "baidu.com")
+		fmt.Println("  Testing TCP (curl http://www.baidu.com)...")
+		runCommand("curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}s", "http://www.baidu.com")
 
-		// Wait for Ctrl-C
-		fmt.Println("\n  Relay is live. Press Ctrl-C to disconnect.")
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-		<-sigChan
+		// Tests done — auto-exit (cleanup follows)
+		fmt.Println("\n  Tests complete. Disconnecting...")
 	} else {
 		// Non-TUN mode: hold for 5s then exit (stage 2 behavior)
 		fmt.Println("\nHolding connection for 5s to verify stability...")
@@ -316,4 +332,12 @@ func platformPingArgs(host string) []string {
 		return []string{"-n", "4", host}
 	}
 	return []string{"-c", "4", host}
+}
+
+// platformPingArgsWithSource returns ping args bound to a source IP.
+func platformPingArgsWithSource(host, srcIP string) []string {
+	if runtime.GOOS == "windows" {
+		return []string{"-n", "4", "-S", srcIP, host}
+	}
+	return []string{"-c", "4", "-I", srcIP, host}
 }
