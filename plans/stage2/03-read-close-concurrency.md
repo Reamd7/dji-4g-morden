@@ -79,10 +79,17 @@ func (t *QMITransport) Write(buf []byte) (int, error) {
 
 ## 交付物 / 完成标志
 
-- [ ] Read 长阻塞(方向 F),运行期 0 cancel
-- [ ] Close 用 writeMu 协调,readCancel 前无并发 write
-- [ ] `go test -race` 通过(子计划 04 的并发测试)
-- [ ] 硬件压测:并发拨号请求 + Close 反复重跑,0 segfault(issue/001 不重现)
+- [x] ~~Read 长阻塞(方向 F),运行期 0 cancel~~ → 模型 B:中断 goroutine 长阻塞(零 cancel),Read 用 select+timer
+- [x] ~~Close 用 writeMu 协调~~ → 升级为 **`ioMu`**(序列化所有 dev.Control,不只 Write)
+- [x] `go test -race` 通过(50 轮并发 Read+Write+Close)
+- [x] 硬件压测:10 轮并发 Read+Write+Close,0 segfault(issue/001 窗口已关闭)
+
+## 实现说明(模型 B 适配)
+
+计划原文针对模型 A(bulk)。模型 B 的并发风险不同但同类:
+gousb v1.1.3 无 `Device.ControlContext` → 控制传输无法 cancel →
+Close 必须用互斥锁等所有 in-flight `dev.Control` 完成后才能释放 handle。
+用单个 `ioMu` 替代计划的 `writeMu`,保护范围更广(Read GET + Write SEND + Close DTR/释放)。
 
 ## 风险
 
