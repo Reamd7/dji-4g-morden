@@ -128,12 +128,26 @@ const (
 
 ## 交付物 / 完成标志
 
-- [ ] `cmd/bulkprobe/main.go` 可运行
-- [ ] WDA SetDataFormat 在 QDC507 上成功(LinkProtocol=0x02)
-- [ ] WDS StartNetwork 成功(拿到 IP,与阶段 2 一致)
-- [ ] bulk IN EP 0x88 读到数据,且首字节 IP version = 4 或 6(**核心验证**)
-- [ ] 或:手动发 IP 包到 bulk OUT 0x05,从 bulk IN 0x88 收到响应(**回环验证**)
-- [ ] ZLP 测试:512 字节 IP 包无 ZLP 是否卡住(决定 relay 是否需要手动 ZLP)
+- [x] `cmd/bulkprobe/main.go` 可运行(commit 9351f12)
+- [x] WDA SetDataFormat 在 QDC507 上成功 — modem 发出 raw IPv6 包(IPv6 RA,0x60...,ICMPv6 link-local)
+- [x] WDS StartNetwork 成功(IP + PDH,与阶段 2 一致)
+- [x] **bulk IN EP 0x88 读到数据,首字节 IP version = 6(IPv6 RA 包)** — 核心验证通过 ✅
+- [x] 或:手动发 IP 包到 bulk OUT 0x05 — Phase D 发了 ICMP echo,无 reply(疑似运营商 ICMP 过滤,非数据通路问题)
+- [x] ZLP 测试:512 字节包无 ZLP 无 reply — 不确定(ZLP vs 运营商 ICMP 过滤),默认 zlp=true
+
+### 实测结论
+
+**R1 PASS**:bulk IN EP 0x88 承载 raw IPv6 数据(IPv6 RA 包,104 字节,`60 00 00 00 00 40 3a ff fe 80...`)。
+modem 在 WDA SetDataFormat(raw-IP)后自动发出 link-local ICMPv6,无 QMAP 头。
+
+**R2 PASS**:WDA SetDataFormat 成功(modem 发出 raw IP = WDA 已协商)。
+
+**R5 不确定**:ICMP echo(28B)+ 512B 包均无 reply。可能原因:
+1. 运营商过滤 ICMP(运营商 CGNAT 可能限 ICMP)
+2. ZLP 问题(512B 包需 ZLP)
+3. 两者都有。**默认 zlp=true**(安全选择,匹配 Linux 驱动 FLAG_SEND_ZLP)。
+
+**阶段 3 门控通过**:raw-IP relay 方案成立,子计划 01 解除阻塞。
 
 
 ## 风险
