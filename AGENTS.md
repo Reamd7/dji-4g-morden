@@ -290,68 +290,53 @@ dji-modem-research/
 ├── internal/
 │   ├── usbdesc/     # USB 描述符格式化(纯逻辑,从 usbprobe 抽出,100% 覆盖)
 │   ├── testutil/    # ScriptPort mock io.ReadWriteCloser(供 transport 测试)
-│   └── usbtransport/# ATTransport:USB bulk endpoint → io.ReadWriteCloser
-│       ├── usbtransport.go             # Open/Read(长阻塞读,方向F)/Write/Close
-│       ├── usbtransport_test.go        # mock 单测(ScriptPort + modem NewFromIO 集成)
-│       ├── usbtransport_hardware_test.go # AT 通路硬件集成测试(build tag: hardware)
-│       └── sms_hardware_test.go        # 短信收发硬件集成测试(build tag: hardware)
+│   ├── usbtransport/# ATTransport:USB bulk endpoint → io.ReadWriteCloser
+│   │   ├── usbtransport.go             # Open/Read(长阻塞读,方向F)/Write/Close
+│   │   ├── usbtransport_test.go        # mock 单测(ScriptPort + modem NewFromIO 集成)
+│   │   ├── usbtransport_hardware_test.go # AT 通路硬件集成测试(build tag: hardware)
+│   │   └── sms_hardware_test.go        # 短信收发硬件集成测试(build tag: hardware)
+│   └── qmitransport/ # QMITransport:USB model B EP0 控制封装 → qmi.Transport
+│       ├── qmitransport.go             # Open/DTR/interrupt goroutine/Read(GET)/Write(SEND)/Close(ioMu)
+│       ├── qmitransport_test.go        # 11 个离线 mock 测试(-race,~93% 适配层覆盖率)
+│       ├── qmitransport_hardware_test.go # transport 级硬件测试(Open/SYNC/并发 Close)
+│       ├── manager_hardware_test.go    # manager 级硬件测试(StartCore/拨号/双栈/并发 Close)
+│       └── AGENTS.md                   # 记忆点:模型 B + DTR + ioMu + issue/001 防护
 ├── third_party/
 │   ├── sms-gateway/ # 从 sms_gateway 复制的 AT 协议层"壳"(AGPL-3.0)
-│   │   ├── LICENSE
-│   │   └── modem/   # SG 壳:readerLoop/SendAndWait/transport + AT 命令全集
-│   │       ├── modem.go          # 并发模型 + NewFromIO + readLine(USB 适配)
-│   │       ├── sms.go            # Initialize/Send(多段)/ListStored/ReadStored/设备查询/SetSMSCallback(+CMTI 管道)
-│   │       ├── pdu.go            # PDU facade(~100行,委托 smscodec;保留 DecodedSMS/ConcatInfo/DecodeDeliver)
-│   │       ├── network.go        # 网络注册/拨号状态(CREG/CGATT/CGDCONT/QNWINFO,Phase B)
-│   │       ├── sim.go            # SIM APDU 透传(CSIM/CRSM,Phase D)
-│   │       ├── config.go         # 配置/复位(CFUN/QCFG,Phase C)
-│   │       ├── sms_test.go       # SG 原有 + 扩展的离线测试
-│   │       ├── pdu_test.go       # facade 离线测试(GSM-7 扩展表/长短信等回归)
-│   │       └── roadmap_test.go   # 11 条 AT 命令全集的离线测试(Phase A-E)
-│   └── smscodec/     # 从 vohive verbatim 复制的 PDU 编解码"芯"(PolyForm NC + warthog618 MIT)
-│       ├── LICENSE              # vohive PolyForm Noncommercial
-│       ├── pdu.go               # DecodeDeliverTPDU/BuildSubmitTPDUs + RPDU 函数
-│       ├── reassembler.go       # 长短信分片重组
-│       ├── pdu_trim.go          # 国产模组 GSM-7 spare bit 清零 + PDU 长度裁剪
-│       ├── binary_classifier.go # 8-bit 二进制短信分类(OMA CP/WAP/MMS,当前不验证)
-│       ├── wbxml_omacp.go       # OMA CP WBXML 解码(同上)
-│       └── *_test.go            # reassembler/pdu 编码/pdu_trim 离线回归向量
-│   └── quectel-qmi-go/  # 从 vohive 复制的 QMI 协议栈(license 待确认)
-│       ├── LICENSE              # NOTICE:源码无 license 文件,待确认
-│       ├── qmi/                 # 协议栈核心(34 Go 文件):QMUX 分帧 + WDS/WDA/DMS/NAS/UIM/WMS/IMS/VOICE
-│       │   ├── client.go        # Client + readLoop/writerLoop/indicationLoop + SyncOnOpen
-│       │   ├── transport.go     # qmiTransport 接口(Read/Write/Close/SetReadDeadline)
-│       │   ├── transport_export.go # NewClientFromTransport + Transport 导出(注入点)
-│       │   ├── frame.go         # QMUX/CTL/Service 帧编解码 + Packet.Marshal/Unmarshal
+│   │   └── modem/   # SG 壳:readerLoop/SendAndWait + AT 命令全集(Phase A-E)
+│   ├── smscodec/    # 从 vohive 复制的 PDU 编解码(warthog618/sms MIT + PolyForm NC)
+│   └── quectel-qmi-go/  # 从 vohive 复制的 QMI 协议栈 + manager(license 待确认)
+│       ├── qmi/                 # 协议栈核心:QMUX 分帧 + WDS/WDA/DMS/NAS/UIM/WMS/IMS/VOICE
+│       │   ├── transport_export.go # NewClientFromTransport 注入点(绕过 /dev/cdc-wdm0)
 │       │   └── *.go             # 各 service wrapper + 测试
-│       └── netcfg/              # 三平台网络配置(Linux/macOS/Windows,阶段 3 用)
+│       ├── manager/             # 全功能连接管理器(状态机/重连/拨号/netcfg,~13K 行)
+│       │   ├── manager.go       # 核心:Start/Connect/Stop + service 编排 + 重连
+│       │   ├── usb_entry.go     # NewWithClient:USB 注入点(SettingsV6/HandleV4/V6 getter)
+│       │   └── *.go             # callbacks/snapshot/service_recovery/smsc/uim/...
+│       ├── device/              # Linux sysfs 设备发现(USB 路径不用,hook 绕过)
+│       └── netcfg/              # 三平台网络配置(阶段 3 用)
 ├── cmd/
 │   ├── usbprobe/    # USB 接口/endpoint 枚举探针(硬件,go run)
 │   ├── attest/      # MI_02 AT 通路验证(硬件,go run)
-│   └── qmiprobe/    # QMI 传输模型探针(Phase 0:bulk A + control B,硬件,go run)
+│   ├── qmiprobe/    # QMI 传输模型探针(Phase 0,硬件,go run)
+│   └── qmidial/     # QMI 拨号工具(manager Start+Connect,-dial 激活 PDP,硬件)
 ├── issue/
-│   └── 001-gousb-close-transfer-cancel-crash.md  # WinUSB cancel 崩溃判别实验(方向F 根因)
+│   └── 001-gousb-close-transfer-cancel-crash.md  # WinUSB cancel 崩溃(方向F 根因)
 ├── plans/
-│   └── archive/     # 已完成的实施计划(gousb/usb-transport/upgrade-smscodec/at-commands-roadmap)
-└── docs/            # 研究文档(01-03 方案/硬件/源码,04-07 AT 标准与选型,08-10 AT 命令索引与对齐)
-    ├── 01-userland-usb-modem-feasibility.md
-    ├── 04-at-command-standards.md       # AT 命令电信标准规范索引
-    ├── 05-sms-gateway-modem-analysis.md # SG modem 剖析
-    ├── 06-vohive-modem-analysis.md      # vohive modem + smscodec 剖析
-    ├── 07-at-implementation-comparison.md # 三实现对比 + 选型(路线 A/B/C)
-    ├── 08-ec25-at-commands-index.md     # EC25 AT 命令索引
-    ├── 09-ec20-at-commands-index.md     # EC20 AT 命令索引
-    ├── 10-at-commands-alignment.md      # 逐命令对齐状态(SG/VH 溯源 + 大类评分)
-    ├── EC25_EC21_AT_Commands_Manual_V1.2.pdf
-    └── EC20_AT_Commands_Manual.pdf
+│   ├── stage2-qmi-dialup.md  # 阶段 2 总览
+│   ├── stage2/               # 阶段 2 子计划 00-08
+│   └── archive/              # 已完成的计划(gousb/usb-transport/upgrade-smscodec/at-commands-roadmap)
+├── references/     # 外部参考资料(osmocom/sixfab,linux-driver gitignored)
+└── docs/           # 研究文档(01-03 方案/硬件/源码,04-10 AT 命令)
 ```
 
 - `go.mod` 模块名:`dji-modem-research`
-- 依赖:`github.com/google/gousb`(USB)、`github.com/rs/zerolog` + `go.bug.st/serial`(modem 包保留)、`github.com/warthog618/sms`(smscodec 用,MIT)
+- 依赖:`github.com/google/gousb`(USB)、`github.com/rs/zerolog` + `go.bug.st/serial`(modem)、`github.com/warthog618/sms`(smscodec)、`github.com/sirupsen/logrus` + `go.uber.org/zap`(manager)
 - 运行 AT 测试:`mise exec -- go run ./cmd/attest/`
-- 运行 QMI 探针:`mise exec -- go run ./cmd/qmiprobe`
+- 运行 QMI 拨号(只读):`mise exec -- go run ./cmd/qmidial`
+- 运行 QMI 拨号(激活 PDP):`mise exec -- go run ./cmd/qmidial -dial`
 - 跑 mock 单测:`make test-race`
-- 跑硬件集成测试(需 EC25 + WinUSB):`make test-hardware`
+- 跑硬件集成测试(需设备 + WinUSB):`make test-hardware`
 
 ### third_party 复制方案(非 replace,SG 壳 + smscodec 芯)
 
@@ -359,4 +344,4 @@ dji-modem-research/
 
 - **`sms-gateway/modem/`**(AGPL-3.0):AT 协议"壳"。核心改动:`port serial.Port` → `io.ReadWriteCloser` + `NewFromIO`(transport 注入);`readLine` USB 适配(`>` 提示符 + 逐字节读,方向F);`pdu.go` facade 化(委托 smscodec);补 11 条 AT 命令(network/sim/config 新文件);`SetSMSCallback` +CMTI 实时收信管道。保留 ICMP ping / zerolog / Open 串口路径。
 - **`smscodec/`**(vohive PolyForm NC + warthog618 MIT):PDU 编解码"芯"。**verbatim 一行不改**,委托 warthog618/sms 完整实现 TS 23.040(GSM-7 扩展表/长短信分段/重组),加国产模组容错(pdu_trim.go)。零 vohive 内部包依赖(复制前提)。
-- **`quectel-qmi-go/`**(license 待确认):QMI 协议栈。复制 `pkg/qmi/`(34 文件,QMUX 分帧 + WDS/WDA/DMS/NAS/UIM/WMS/IMS/VOICE service wrapper)+ `pkg/netcfg/`(三平台网络配置,阶段 3 用)。新增 `transport_export.go` 导出 `NewClientFromTransport` + `Transport` 接口别名,注入用户态 USB transport(模型 B + DTR),绕过 `/dev/cdc-wdm0` 内核驱动依赖。不复制 manager/device(Linux 耦合)。
+- **`quectel-qmi-go/`**(license 待确认):QMI 协议栈 + manager。复制 `qmi/`(协议栈)+ `manager/`(全功能连接管理器,~13K 行)+ `device/`(Linux 设备发现)+ `netcfg/`(三平台网络配置)。`transport_export.go` 导出 `NewClientFromTransport` 注入 USB transport;`usb_entry.go` 导出 `NewWithClient` 注入预构造 client(hook 绕过 /dev/cdc-wdm0 + Linux sysfs)。阶段 2 拨号验证通过(IPv4+IPv6 双栈)。
