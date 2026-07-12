@@ -225,3 +225,72 @@ func (s *NetstackSink) ReadPacket() ([]byte, error) { ... }
    - DNS 解析(netstack 内置 DNS resolver 或用 114.114.114.114)
    - IPv6 双栈(netstack 支持 IPv6)
    - 连接统计(netstack metrics)
+
+## 多设备场景:多 4G 链路(进一步强化 netstack 方案)
+
+如果同时插入多个 DJI 4G 模块(各自独立 SIM/运营商),TUN 方案和 netstack 方案的差距会进一步拉大。
+
+### TUN 方案:多设备 = 路由地狱
+
+```
+qmi0: 10.147.0.1/27  (Modem #1)
+qmi1: 10.147.0.2/27  (Modem #2)     ← 3 个 TUN 适配器
+qmi2: 10.147.0.3/27  (Modem #3)     ← route table 冲突 + source binding
+```
+- 多条默认路由 metric 谁先?
+- 源地址绑定每个包都要查
+- DNS 用谁的?
+- failover 检测 + 切换逻辑复杂
+- macOS utun 序号乱跳
+
+### netstack + SOCKS5 方案:多设备 = 天然多端口/负载均衡
+
+```
+# 独立端口模式:每个模块一个 SOCKS5
+Modem #1 (<运营商>) → netstack → SOCKS5 :1081
+Modem #2 (移动) → netstack → SOCKS5 :1082
+Modem #3 (电信) → netstack → SOCKS5 :1083
+
+# 负载均衡模式:所有模块共用一个 SOCKS5
+┌─ netstack #1 ─┐
+├─ netstack #2 ─┤→ SOCKS5 :1080 (round-robin / least-latency / failover)
+└─ netstack #3 ─┘
+```
+
+### 架构改动(极小)
+
+每个组件已是实例化设计,只需多实例化:
+
+```go
+devices, _ := ctx.ListDevicesBySerial()       // 按 serial 枚举全部模块
+for i, dev := range devices {
+    transport := qmitransport.Open(dev)         // 独立 QMI(每个模块各 claim MI_04)
+    mgr := manager.New(transport)               // 独立 manager
+    mgr.Dial(apn)                               // 独立拨号,各拿各的 IP/PDH
+    sink := netstack.New(mgr.IP(), mgr.DNS())   // 独立 netstack 实例
+    socks5.Listen(fmt.Sprintf(":%d", 1081+i), sink)
+}
+```
+
+### 多设备能力矩阵
+
+| 场景 | 说明 | netstack 实现方式 |
+|---|---|---|
+| 负载均衡 | 3× 4G = 3× 带宽 | SOCKS5 round-robin 分发到 N 个 netstack |
+| Failover | 主模块断线自动切备用 | health check + 自动摘除故障后端 |
+| 多运营商 | 运营商 A+B+C,选最优 | 每模块独立 SOCKS5 端口,App 手选 |
+| 多 APN | 专网+公网同时在线 | 不同 APN 拨不同模块,各走各的 |
+| SIM 池 | N 张卡轮换规避限额 | 动态启停不同模块的 QMI session |
+
+### 对比结论
+
+| 维度 | TUN 多设备 | netstack 多设备 |
+|---|---|---|
+| 路由冲突 | ❌ 严重 | ✅ 无(SOCKS5 不碰路由表) |
+| 管理员权限 | ✅ 每个都要 | ❌ 零 |
+| 负载均衡 | ❌ 需 ECMP/policy routing | ✅ SOCKS5 层 round-robin |
+| Failover | ❌ 复杂(route convergence) | ✅ SOCKS5 层摘除 |
+| 跨平台 | ❌ 每平台 TUN 行为不同 | ✅ 完全统一 |
+| App 选择性 | ❌ 全局路由不可选 | ✅ 连接级别选 SOCKS5 端口 |
+
+**多设备场景是 netstack+SOCKS5 方案的杀手级用例。** TUN 方案在单设备时勉强可用,多设备时复杂度爆炸。
