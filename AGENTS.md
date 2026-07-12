@@ -150,6 +150,16 @@ type DataSink interface {
 - `docs/performance/01-qcusbwwan-reverse-engineering.md` — 官方驱动逆向 + QMAP/韧性/异步等可迁移设计思想
 - `docs/performance/02-tun-alternatives.md` — TUN 替代方案对比 + 多设备场景分析
 - `docs/11-quectel-driver-mbb-mechanism.md` — 官方驱动「移动数据」面板机制(IF_TYPE_WWANPP)
+- `docs/12-voice-call-feasibility.md` — 语音通话可行性分析(未创建,待探测后写)
+
+### 未来方向:语音通话(2026-07-13 记录)
+
+PC 上接听/拨打语音通话。信令控制(AT ATA/ATD/ATH/CLIP)已可做(同短信机制),**音频通路是核心难点**——QDC507 的 5 个 USB 接口均无 USB Audio Class (UAC),音频默认走 PCM/I2S 物理引脚,不在 USB 上。
+
+三条待探测路径(切回 WinUSB 后一次性探测):
+1. **VoLTE RTP 截获**:来电时监控 bulk IN 0x88 是否出现 UDP/RTP 包。若 VoLTE RTP 走 QMI data channel,relay 可截获 → AMR 解码 → PC 音频
+2. **QMI Voice 服务(service 0x09)**:SYNC → GetClientList 看是否暴露 Voice 服务 + AMR-over-QMI。逆向 `qcusbwwan.sys` 未见 QMI Voice 字符串,可能性较低
+3. **USB 音频接口切换**:`AT+QDAI?` / `AT+QAUDMOD?` / `AT+QCFG="usbnet",?` 查询音频路由是否可切到 USB
 
 ### 目录结构
 
