@@ -127,6 +127,7 @@ func main() {
 
 	buf := make([]byte, 65535)
 	count := 0
+	var lastVersion byte // IP version nibble of last successfully-read packet
 	for {
 		n, err := bulkIn.ReadContext(readCtx, buf)
 		if err != nil {
@@ -137,6 +138,7 @@ func main() {
 		}
 		pkt := buf[:n]
 		version := pkt[0] >> 4
+		lastVersion = version
 		fmt.Printf("  bulk IN: %d bytes, IP version=%d, first 20 bytes: % x\n",
 			n, version, pkt[:min(20, n)])
 		count++
@@ -144,10 +146,9 @@ func main() {
 	fmt.Printf("  Read %d packets in 8s\n", count)
 
 	if count > 0 {
-		firstByte := buf[0]
-		if firstByte>>4 == 4 || firstByte>>4 == 6 {
+		if lastVersion == 4 || lastVersion == 6 {
 			fmt.Println("\n✓ bulk EP carries raw IP data — stage 3 relay is viable")
-		} else if firstByte <= 0x7f {
+		} else if lastVersion <= 7 {
 			fmt.Println("\n⚠ bulk EP data looks like QMAP (mux_id header) — need strip/add layer")
 		}
 	} else {
