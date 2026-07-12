@@ -192,7 +192,8 @@ func TestHardwareRelayEndToEnd(t *testing.T) {
 	if runtime.GOOS == "darwin" {
 		offset = 4
 	}
-	bridge := New(tunDev, bulkIn, bulkOut, offset, 1500, true)
+	sink := NewTUNPacketSink(tunDev, offset, 1500)
+	bridge := New(sink, bulkIn, bulkOut, 1500, true)
 	bridge.Start(ctx)
 
 	time.Sleep(3 * time.Second) // let relay stabilize

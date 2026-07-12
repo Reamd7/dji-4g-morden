@@ -25,8 +25,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"time"
+
+	"net/netip"
 
 	"golang.zx2c4.com/wireguard/tun"
 
@@ -39,11 +42,16 @@ import (
 func main() {
 	dial := flag.Bool("dial", false, "perform WDS dialup (activates PDP context, may incur data charges)")
 	tunMode := flag.Bool("tun", false, "create TUN + start relay for actual internet (implies -dial, needs admin)")
+	socks5Mode := flag.Bool("socks5", false, "start SOCKS5 proxy via netstack (implies -dial, no admin needed)")
+	socks5Addr := flag.String("socks5-addr", "127.0.0.1:1080", "SOCKS5 listen address")
 	apn := flag.String("apn", "3gnet", "APN for dialup")
 	flag.Parse()
 
 	if *tunMode {
 		*dial = true // -tun implies -dial
+	}
+	if *socks5Mode {
+		*dial = true // -socks5 implies -dial
 	}
 
 	ctx := context.Background()
@@ -100,8 +108,10 @@ func main() {
 		}
 		tunName, _ = tunDev.Name() // actual name (macOS may rename to utunN)
 		fmt.Printf("      OK — TUN created: %s (MTU 1500)\n", tunName)
+	} else if *socks5Mode {
+		fmt.Println("[3/8] SOCKS5 mode: no TUN needed (netstack userspace TCP/IP)")
+		tunName = "dummy" // triggers WDA allocation; NoRoute+NoDNS skip OS network config
 	} else {
-		fmt.Println("[3/8] Skipping TUN (no -tun flag)")
 	}
 
 	// 4. Manager (USB injection via NewWithClient)
@@ -115,6 +125,10 @@ func main() {
 			IndicationRegister: 15 * time.Second,
 			Init:               30 * time.Second,
 		},
+	}
+	if *socks5Mode {
+		cfg.NoRoute = true
+		cfg.NoDNS = true
 	}
 	mgr := manager.NewWithClient(cfg, nil, client)
 	fmt.Println("      OK — hook set, client injected")
@@ -187,8 +201,9 @@ func main() {
 		if runtime.GOOS == "darwin" {
 			offset = 4
 		}
+		tunSink := qmidatapath.NewTUNPacketSink(tunDev, offset, 1500)
 		// zlp=true: subplan 00 D2 confirmed QDC507 needs ZLP for 512-multiple packets
-		bridge = qmidatapath.New(tunDev, bulkIn, bulkOut, offset, 1500, true)
+		bridge = qmidatapath.New(tunSink, bulkIn, bulkOut, 1500, true)
 		if err := bridge.Start(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "Bridge.Start failed: %v\n", err)
 			mgr.Stop()
@@ -278,6 +293,73 @@ func main() {
 		fmt.Printf("  Phase 2: %d TX + %d RX (global TUN)\n", txPkt2-txPkt1, rxPkt2-rxPkt1)
 
 		fmt.Println("\n  Tests complete. Disconnecting...")
+	} else if *socks5Mode {
+		// SOCKS5 mode: create netstack sink + relay + SOCKS5 server
+		fmt.Println("[8/8] Starting SOCKS5 relay (bulk EP ↔ netstack)...")
+
+		bulkIn, bulkOut, err := transport.OpenBulkEndpoints()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "OpenBulkEndpoints failed: %v\n", err)
+			mgr.Stop()
+			client.Close()
+			transport.Close()
+			os.Exit(1)
+		}
+		fmt.Println("      OK — bulk IN 0x88 + bulk OUT 0x05 opened")
+
+		s := mgr.Settings()
+		if s == nil || len(s.IPv4Address) == 0 {
+			fmt.Fprintf(os.Stderr, "No IPv4 address from dialup\n")
+			mgr.Stop()
+			client.Close()
+			transport.Close()
+			os.Exit(1)
+		}
+
+		// Create netstack sink with modem-assigned IP
+		localIP := netip.AddrFrom4([4]byte{s.IPv4Address[0], s.IPv4Address[1], s.IPv4Address[2], s.IPv4Address[3]})
+		netstackSink, err := qmidatapath.NewNetstackPacketSink(localIP, int(s.MTU), true, netip.Addr{})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "NewNetstackPacketSink failed: %v\n", err)
+			mgr.Stop()
+			client.Close()
+			transport.Close()
+			os.Exit(1)
+		}
+
+		bridge = qmidatapath.New(netstackSink, bulkIn, bulkOut, int(s.MTU), true)
+		if err := bridge.Start(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Bridge.Start failed: %v\n", err)
+			netstackSink.Close()
+			mgr.Stop()
+			client.Close()
+			transport.Close()
+			os.Exit(1)
+		}
+
+		// Start SOCKS5 server
+		socksCtx, socksCancel := context.WithCancel(ctx)
+		go func() {
+			fmt.Printf("      SOCKS5 listening on %s (no admin needed)\n", *socks5Addr)
+			fmt.Printf("      curl --socks5-hostname %s http://www.baidu.com\n", *socks5Addr)
+			if err := qmidatapath.RunSOCKS5(socksCtx, netstackSink, *socks5Addr); err != nil {
+				fmt.Fprintf(os.Stderr, "SOCKS5 server: %v\n", err)
+			}
+		}()
+
+		// Wait for Ctrl+C
+		fmt.Println("\n  Press Ctrl+C to stop...")
+		waitForSignal()
+
+		// Cleanup socks5
+		socksCancel()
+		netstackSink.Close()
+		bridge.Stop()
+		mgr.Stop()
+		client.Close()
+		transport.Close()
+		fmt.Println("Done.")
+		return
 	} else {
 		// Non-TUN mode: hold for 5s then exit (stage 2 behavior)
 		fmt.Println("\nHolding connection for 5s to verify stability...")
@@ -423,4 +505,11 @@ func allowICMPFirewall() {
 		"name=qmi-tun-icmp-out", "protocol=icmpv4:8,any", "dir=out", "action=allow")
 	runCommand("netsh", "advfirewall", "firewall", "add", "rule",
 		"name=qmi-tun-icmp-in", "protocol=icmpv4:0,any", "dir=in", "action=allow")
+}
+
+// waitForSignal blocks until SIGINT (Ctrl+C) or SIGTERM.
+func waitForSignal() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	<-sigCh
 }

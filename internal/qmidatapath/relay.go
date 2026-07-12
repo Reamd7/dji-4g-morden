@@ -1,23 +1,24 @@
 // Package qmidatapath implements a bidirectional raw-IP relay between a USB
-// bulk endpoint pair (QMI data channel) and a TUN virtual network interface.
+// bulk endpoint pair (QMI data channel) and a PacketSink (TUN device or
+// gVisor netstack channel).
 //
 // After WDA SetDataFormat(LinkProtocolIP) + WDS StartNetwork (stage 2),
 // the modem sends/receives raw IP packets (no ethernet header, no QMAP
-// wrapper) on MI_04's bulk IN (EP 0x88) / bulk OUT (EP 0x05). The TUN
-// device (wireguard/tun) is also layer-3 (raw IP). Both sides agree on
-// framing, so the relay is a direct byte-for-byte forward.
+// wrapper) on MI_04's bulk IN (EP 0x88) / bulk OUT (EP 0x05). Both TUN
+// and netstack channel are layer-3 (raw IP). All sides agree on framing,
+// so the relay is a direct byte-for-byte forward.
 //
 //   ┌──────────────┐   raw IP   ┌──────────────────┐   raw IP   ┌──────────────┐
-//   │ Host network │ ─────────▶ │  TUN Device      │ ─────────▶ │ Modem USB    │
-//   │  stack       │  TUN.Read  │  (wireguard/tun) │  bulk OUT  │ EP 0x05 OUT  │
+//   │ Host network │ ─────────▶ │  PacketSink      │ ─────────▶ │ Modem USB    │
+//   │  stack       │  ReadPacket│  (TUN/netstack)  │  bulk OUT  │ EP 0x05 OUT  │
 //   │              │ ◀───────── │                  │ ◀───────── │ EP 0x88 IN   │
-//   │              │  TUN.Write │                  │  bulk IN   │              │
+//   │              │ WritePacket│                  │  bulk IN   │              │
 //   └──────────────┘            └──────────────────┘            └──────────────┘
 //
 // The relay has two goroutines:
 //
-//   - tunToModem: TUN.Read → bulkOut.Write (+ optional ZLP for 512-multiple)
-//   - modemToTun: bulkIn.ReadContext → TUN.Write
+//   - sinkToModem: sink.ReadPacket → bulkOut.Write (+ optional ZLP for 512-multiple)
+//   - modemToSink: bulkIn.ReadContext → sink.WritePacket
 //
 // ZLP (Zero Length Packet): the modem's bulk OUT endpoint has maxPacketSize=512.
 // When a TX packet's length is an exact multiple of 512, the modem may buffer
@@ -46,28 +47,17 @@ type BulkWriter interface {
 	Write(buf []byte) (int, error)
 }
 
-// tunDevice abstracts wireguard/tun.Device for testing.
-// wireguard/tun.Device satisfies this (it has all these methods and more).
-type tunDevice interface {
-	Read(bufs [][]byte, sizes []int, offset int) (int, error)
-	Write(bufs [][]byte, offset int) (int, error)
-	Name() (string, error)
-	Close() error
-	BatchSize() int
-}
-
 // USB 2.0 high-speed bulk endpoint maxPacketSize.
 const bulkMaxPacketSize = 512
 
-// Bridge relays raw IP packets between a USB bulk endpoint pair and a TUN
-// device. Both sides are layer-3 (no ethernet header), so packets pass
+// Bridge relays raw IP packets between a USB bulk endpoint pair and a
+// PacketSink. Both sides are layer-3 (no ethernet header), so packets pass
 // through unchanged.
 type Bridge struct {
-	tun     tunDevice
+	sink    PacketSink
 	bulkIn  BulkReader
 	bulkOut BulkWriter
-	offset  int // macOS=4 (utun AF-family headroom), others=0
-	mtu     int // typically 1500
+	mtu     int
 	zlp     bool // append ZLP after 512-multiple TX packets
 
 	cancel  context.CancelFunc
@@ -76,9 +66,9 @@ type Bridge struct {
 	started bool
 
 	// Packet counters (atomic, for debugging)
-	txPackets atomic.Int64 // TUN → modem (uplink)
+	txPackets atomic.Int64 // sink → modem (uplink)
 	txBytes   atomic.Int64
-	rxPackets atomic.Int64 // modem → TUN (downlink)
+	rxPackets atomic.Int64 // modem → sink (downlink)
 	rxBytes   atomic.Int64
 }
 
@@ -87,21 +77,19 @@ func (b *Bridge) Stats() (txPkt, txByt, rxPkt, rxByt int64) {
 	return b.txPackets.Load(), b.txBytes.Load(), b.rxPackets.Load(), b.rxBytes.Load()
 }
 
-// New creates a Bridge. tun/bulkIn/bulkOut must be pre-opened by the caller.
-// offset: runtime.GOOS=="darwin" ? 4 : 0.
+// New creates a Bridge. sink/bulkIn/bulkOut must be pre-opened by the caller.
 // zlp: true if the modem needs ZLP (confirmed by subplan 00 probe — true for QDC507).
-func New(tun tunDevice, bulkIn BulkReader, bulkOut BulkWriter, offset, mtu int, zlp bool) *Bridge {
+func New(sink PacketSink, bulkIn BulkReader, bulkOut BulkWriter, mtu int, zlp bool) *Bridge {
 	return &Bridge{
-		tun:     tun,
+		sink:    sink,
 		bulkIn:  bulkIn,
 		bulkOut: bulkOut,
-		offset:  offset,
 		mtu:     mtu,
 		zlp:     zlp,
 	}
 }
 
-// Start launches the two relay goroutines (TUN→modem, modem→TUN).
+// Start launches the two relay goroutines (sink→modem, modem→sink).
 // Idempotent — calling twice is a no-op.
 func (b *Bridge) Start(parent context.Context) error {
 	b.mu.Lock()
@@ -115,15 +103,22 @@ func (b *Bridge) Start(parent context.Context) error {
 	b.started = true
 
 	b.wg.Add(2)
-	go b.tunToModem(ctx)
-	go b.modemToTun(ctx)
+	go b.sinkToModem(ctx)
+	go b.modemToSink(ctx)
 
 	return nil
 }
 
 // Stop cancels the relay context and waits for both goroutines to exit.
-// Does NOT close the TUN — the caller owns TUN lifecycle.
+// Does NOT close the sink — the caller owns sink lifecycle.
 // Safe to call after Start; safe to call multiple times.
+//
+// NOTE: For TUN-backed sinks, the caller MUST close the TUN before calling
+// Stop (or simultaneously), because TUNPacketSink.ReadPacket blocks on
+// tun.Read which doesn't respect context cancellation. Closing the TUN
+// unblocks the read, allowing the goroutine to exit so Stop's wg.Wait()
+// can return. Netstack-backed sinks don't have this issue (channel close
+// immediately unblocks ReadContext).
 func (b *Bridge) Stop() {
 	b.mu.Lock()
 	if !b.started {
@@ -139,23 +134,13 @@ func (b *Bridge) Stop() {
 	b.wg.Wait()
 }
 
-// Flow 1: TUN → modem (uplink).
-// Reads IP packets from the TUN device and writes them to the USB bulk OUT
+// Flow 1: sink → modem (uplink).
+// Reads IP packets from the PacketSink and writes them to the USB bulk OUT
 // endpoint. When zlp is enabled, appends a Zero Length Packet after any
 // packet whose length is an exact multiple of the bulk endpoint's
 // maxPacketSize (512 bytes).
-func (b *Bridge) tunToModem(ctx context.Context) {
+func (b *Bridge) sinkToModem(ctx context.Context) {
 	defer b.wg.Done()
-
-	batchSize := b.tun.BatchSize()
-	if batchSize < 1 {
-		batchSize = 1
-	}
-	bufs := make([][]byte, batchSize)
-	sizes := make([]int, batchSize)
-	for i := range bufs {
-		bufs[i] = make([]byte, b.mtu+b.offset)
-	}
 
 	for {
 		select {
@@ -164,45 +149,44 @@ func (b *Bridge) tunToModem(ctx context.Context) {
 		default:
 		}
 
-		n, err := b.tun.Read(bufs, sizes, b.offset)
+		pkt, err := b.sink.ReadPacket(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("qmidatapath: TUN read error: %v", err)
+			log.Printf("qmidatapath: sink read error: %v", err)
+			continue
+		}
+		if len(pkt) == 0 {
 			continue
 		}
 
-		for i := 0; i < n; i++ {
-			pkt := bufs[i][b.offset : b.offset+sizes[i]]
-			b.txPackets.Add(1)
-			b.txBytes.Add(int64(len(pkt)))
-			if _, err := b.bulkOut.Write(pkt); err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				log.Printf("qmidatapath: bulk OUT write error: %v", err)
-				continue
+		b.txPackets.Add(1)
+		b.txBytes.Add(int64(len(pkt)))
+		if _, err := b.bulkOut.Write(pkt); err != nil {
+			if ctx.Err() != nil {
+				return
 			}
-			// R5 ZLP: if pkt length is a multiple of bulk OUT maxPacketSize,
-			// the modem may buffer it waiting for more data. Append a 0-byte
-			// write (Zero Length Packet) to signal end-of-transfer.
-			if b.zlp && len(pkt)%bulkMaxPacketSize == 0 {
-				b.bulkOut.Write([]byte{})
-			}
+			log.Printf("qmidatapath: bulk OUT write error: %v", err)
+			continue
+		}
+		// R5 ZLP: if pkt length is a multiple of bulk OUT maxPacketSize,
+		// the modem may buffer it waiting for more data. Append a 0-byte
+		// write (Zero Length Packet) to signal end-of-transfer.
+		if b.zlp && len(pkt)%bulkMaxPacketSize == 0 {
+			b.bulkOut.Write([]byte{})
 		}
 	}
 }
 
-// Flow 2: modem → TUN (downlink).
-// Reads raw IP from the USB bulk IN endpoint and writes it to the TUN device.
+// Flow 2: modem → sink (downlink).
+// Reads raw IP from the USB bulk IN endpoint and writes it to the PacketSink.
 // A large buffer (65535) is used so a single ReadContext call can receive
 // any IP packet up to the maximum size.
-func (b *Bridge) modemToTun(ctx context.Context) {
+func (b *Bridge) modemToSink(ctx context.Context) {
 	defer b.wg.Done()
 
 	buf := make([]byte, 65535)
-	outBuf := make([]byte, b.mtu+b.offset)
 
 	for {
 		select {
@@ -225,14 +209,11 @@ func (b *Bridge) modemToTun(ctx context.Context) {
 		b.rxPackets.Add(1)
 		b.rxBytes.Add(int64(n))
 
-		// raw-IP: buf[:n] is a bare IP packet. Copy into outBuf with offset
-		// headroom for the TUN's protocol prefix (macOS utun needs 4 bytes).
-		copy(outBuf[b.offset:], buf[:n])
-		if _, err := b.tun.Write([][]byte{outBuf[:b.offset+n]}, b.offset); err != nil {
+		if err := b.sink.WritePacket(buf[:n]); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("qmidatapath: TUN write error: %v", err)
+			log.Printf("qmidatapath: sink write error: %v", err)
 		}
 	}
 }

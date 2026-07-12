@@ -50,75 +50,65 @@ func (f *fakeBulkWriter) packets() [][]byte {
 	return out
 }
 
-// fakeTUN implements tunDevice for testing. Read blocks on rx or done channel.
-// Close unblocks pending Reads.
-type fakeTUN struct {
-	rx        chan []byte // Read pops from here
-	tx        chan []byte // Write pushes here
-	done      chan struct{}
-	batchSize int
+// fakePacketSink implements PacketSink for testing.
+// ReadPacket pops from rx (host → modem). WritePacket pushes to tx (modem → host).
+type fakePacketSink struct {
+	rx       chan []byte // ReadPacket pops from here
+	tx       chan []byte // WritePacket pushes here
+	done     chan struct{}
 	closeOnce sync.Once
 }
 
-func newFakeTUN(batchSize int) *fakeTUN {
-	if batchSize < 1 {
-		batchSize = 1
-	}
-	return &fakeTUN{
-		rx:        make(chan []byte, 16),
-		tx:        make(chan []byte, 16),
-		done:      make(chan struct{}),
-		batchSize: batchSize,
+func newFakePacketSink() *fakePacketSink {
+	return &fakePacketSink{
+		rx:   make(chan []byte, 16),
+		tx:   make(chan []byte, 16),
+		done: make(chan struct{}),
 	}
 }
 
-func (f *fakeTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+func (f *fakePacketSink) ReadPacket(ctx context.Context) ([]byte, error) {
 	select {
 	case p := <-f.rx:
-		copy(bufs[0][offset:], p)
-		sizes[0] = len(p)
-		return 1, nil
+		return p, nil
 	case <-f.done:
-		return 0, fmt.Errorf("tun closed")
+		return nil, fmt.Errorf("sink closed")
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
-func (f *fakeTUN) Write(bufs [][]byte, offset int) (int, error) {
-	for _, b := range bufs {
-		select {
-		case f.tx <- append([]byte(nil), b[offset:]...):
-		case <-f.done:
-			return 0, fmt.Errorf("tun closed")
-		}
+func (f *fakePacketSink) WritePacket(pkt []byte) error {
+	select {
+	case f.tx <- append([]byte(nil), pkt...):
+		return nil
+	case <-f.done:
+		return fmt.Errorf("sink closed")
 	}
-	return len(bufs), nil
 }
 
-func (f *fakeTUN) Name() (string, error) { return "fake0", nil }
-func (f *fakeTUN) Close() error {
+func (f *fakePacketSink) Name() string { return "fake-sink" }
+
+func (f *fakePacketSink) Close() error {
 	f.closeOnce.Do(func() { close(f.done) })
 	return nil
 }
-func (f *fakeTUN) BatchSize() int { return f.batchSize }
 
-// stopBridgeAndTUN is a test helper that stops the bridge and closes the TUN
-// to unblock any pending Read. Bridge.Stop cancels the context (unblocks
-func stopBridgeAndTUN(bridge *Bridge, tun *fakeTUN) {
-	// Close TUN first to unblock tunToModem (which may be blocked in tun.Read),
-	// then Stop to cancel context + wait for both goroutines to exit.
-	tun.Close()
+// stopBridgeAndSink is a test helper that closes the sink and stops the bridge.
+func stopBridgeAndSink(bridge *Bridge, sink *fakePacketSink) {
+	sink.Close()
 	bridge.Stop()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
-// TestRelayModemToTUN verifies that packets from bulk IN are forwarded to TUN.
-func TestRelayModemToTUN(t *testing.T) {
+// TestRelayModemToSink verifies that packets from bulk IN are forwarded to sink.
+func TestRelayModemToSink(t *testing.T) {
 	bulkIn := newFakeBulkReader()
 	bulkOut := &fakeBulkWriter{}
-	tun := newFakeTUN(1)
+	sink := newFakePacketSink()
 
-	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	bridge := New(sink, bulkIn, bulkOut, 1500, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	bridge.Start(ctx)
 
@@ -127,34 +117,34 @@ func TestRelayModemToTUN(t *testing.T) {
 	bulkIn.pkts <- ipv4Pkt
 
 	select {
-	case got := <-tun.tx:
+	case got := <-sink.tx:
 		if len(got) != len(ipv4Pkt) {
-			t.Fatalf("TUN got %d bytes, want %d", len(got), len(ipv4Pkt))
+			t.Fatalf("sink got %d bytes, want %d", len(got), len(ipv4Pkt))
 		}
 		if got[0]>>4 != 4 {
-			t.Fatalf("TUN got version=%d, want 4", got[0]>>4)
+			t.Fatalf("sink got version=%d, want 4", got[0]>>4)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("TUN did not receive packet within 2s")
+		t.Fatal("sink did not receive packet within 2s")
 	}
 
 	cancel()
-	stopBridgeAndTUN(bridge, tun)
+	stopBridgeAndSink(bridge, sink)
 }
 
-// TestRelayTUNToModem verifies that packets from TUN are forwarded to bulk OUT.
-func TestRelayTUNToModem(t *testing.T) {
+// TestRelaySinkToModem verifies that packets from sink are forwarded to bulk OUT.
+func TestRelaySinkToModem(t *testing.T) {
 	bulkIn := newFakeBulkReader()
 	bulkOut := &fakeBulkWriter{}
-	tun := newFakeTUN(1)
+	sink := newFakePacketSink()
 
-	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	bridge := New(sink, bulkIn, bulkOut, 1500, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	bridge.Start(ctx)
 
-	// Push an IPv4 packet into TUN.
+	// Push an IPv4 packet into sink.
 	ipv4Pkt := makeIPv4Packet(64)
-	tun.rx <- ipv4Pkt
+	sink.rx <- ipv4Pkt
 
 	// Wait for bulk OUT to receive it.
 	deadline := time.After(2 * time.Second)
@@ -174,16 +164,16 @@ func TestRelayTUNToModem(t *testing.T) {
 	}
 
 	cancel()
-	stopBridgeAndTUN(bridge, tun)
+	stopBridgeAndSink(bridge, sink)
 }
 
 // TestRelayRawIPPassthrough verifies that raw IP bytes pass through unchanged.
 func TestRelayRawIPPassthrough(t *testing.T) {
 	bulkIn := newFakeBulkReader()
 	bulkOut := &fakeBulkWriter{}
-	tun := newFakeTUN(1)
+	sink := newFakePacketSink()
 
-	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	bridge := New(sink, bulkIn, bulkOut, 1500, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	bridge.Start(ctx)
 
@@ -193,16 +183,16 @@ func TestRelayRawIPPassthrough(t *testing.T) {
 	bulkIn.pkts <- pkt
 
 	select {
-	case got := <-tun.tx:
+	case got := <-sink.tx:
 		if got[20] != 0xAB {
 			t.Fatalf("payload byte changed: got 0x%02x, want 0xAB", got[20])
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("TUN did not receive packet")
+		t.Fatal("sink did not receive packet")
 	}
 
 	cancel()
-	stopBridgeAndTUN(bridge, tun)
+	stopBridgeAndSink(bridge, sink)
 }
 
 // TestRelayZLP verifies that 512-multiple TX packets trigger a ZLP write
@@ -211,18 +201,18 @@ func TestRelayZLP(t *testing.T) {
 	t.Run("ZLPEnabled", func(t *testing.T) {
 		bulkIn := newFakeBulkReader()
 		bulkOut := &fakeBulkWriter{}
-		tun := newFakeTUN(1)
+		sink := newFakePacketSink()
 
-		bridge := New(tun, bulkIn, bulkOut, 0, 1500, true)
+		bridge := New(sink, bulkIn, bulkOut, 1500, true)
 		ctx, cancel := context.WithCancel(context.Background())
 		bridge.Start(ctx)
 
-		// Send a 512-byte packet via TUN (512 = 1 × maxPacketSize).
-		pkt512 := makeIPv4Packet(512) // total IP packet = 512 bytes
+		// Send a 512-byte packet via sink (512 = 1 × maxPacketSize).
+		pkt512 := makeIPv4Packet(512)
 		if len(pkt512) != 512 {
 			t.Fatalf("test packet is %d bytes, want 512", len(pkt512))
 		}
-		tun.rx <- pkt512
+		sink.rx <- pkt512
 
 		// Wait for 2 writes: the packet + the ZLP.
 		deadline := time.After(2 * time.Second)
@@ -245,20 +235,20 @@ func TestRelayZLP(t *testing.T) {
 		}
 
 		cancel()
-		stopBridgeAndTUN(bridge, tun)
+		stopBridgeAndSink(bridge, sink)
 	})
 
 	t.Run("ZLPDisabled", func(t *testing.T) {
 		bulkIn := newFakeBulkReader()
 		bulkOut := &fakeBulkWriter{}
-		tun := newFakeTUN(1)
+		sink := newFakePacketSink()
 
-		bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+		bridge := New(sink, bulkIn, bulkOut, 1500, false)
 		ctx, cancel := context.WithCancel(context.Background())
 		bridge.Start(ctx)
 
 		pkt512 := makeIPv4Packet(512)
-		tun.rx <- pkt512
+		sink.rx <- pkt512
 
 		// Wait for 1 write only (no ZLP).
 		deadline := time.After(2 * time.Second)
@@ -280,49 +270,22 @@ func TestRelayZLP(t *testing.T) {
 		}
 
 		cancel()
-		stopBridgeAndTUN(bridge, tun)
+		stopBridgeAndSink(bridge, sink)
 	})
-}
-
-// TestRelayOffsetMacOS verifies that offset=4 headroom is handled correctly.
-func TestRelayOffsetMacOS(t *testing.T) {
-	bulkIn := newFakeBulkReader()
-	bulkOut := &fakeBulkWriter{}
-	tun := newFakeTUN(1)
-
-	bridge := New(tun, bulkIn, bulkOut, 4, 1500, false) // offset=4 (macOS)
-	ctx, cancel := context.WithCancel(context.Background())
-	bridge.Start(ctx)
-
-	// Push a 64-byte IPv4 packet into bulk IN.
-	ipv4Pkt := makeIPv4Packet(64)
-	bulkIn.pkts <- ipv4Pkt
-
-	select {
-	case got := <-tun.tx:
-		if len(got) != len(ipv4Pkt) {
-			t.Fatalf("TUN got %d bytes with offset=4, want %d", len(got), len(ipv4Pkt))
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("TUN did not receive packet")
-	}
-
-	cancel()
-	stopBridgeAndTUN(bridge, tun)
 }
 
 // TestBridgeStopWaitsGoroutines verifies that Stop blocks until goroutines exit.
 func TestBridgeStopWaitsGoroutines(t *testing.T) {
 	bulkIn := newFakeBulkReader()
 	bulkOut := &fakeBulkWriter{}
-	tun := newFakeTUN(1)
+	sink := newFakePacketSink()
 
-	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	bridge := New(sink, bulkIn, bulkOut, 1500, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	bridge.Start(ctx)
 
-	// Close the TUN to unblock tunToModem, then Stop.
-	tun.Close()
+	// Close the sink to unblock sinkToModem, then Stop.
+	sink.Close()
 	cancel()
 
 	done := make(chan struct{})
@@ -338,24 +301,21 @@ func TestBridgeStopWaitsGoroutines(t *testing.T) {
 	}
 }
 
-// TestBridgeCloseOrdering verifies the critical close ordering:
-// tun.Close() MUST happen before bridge.Stop() — tunToModem blocks in
-// tun.Read which doesn't respect context. Closing TUN unblocks Read,
-// allowing the goroutine to exit so Stop's wg.Wait() can return.
-// Reversing the order would deadlock (Stop waits for goroutine,
-// goroutine waits for TUN Read, TUN never closed).
+// TestBridgeCloseOrdering verifies the close ordering for sinks that
+// don't respect context in ReadPacket (like TUNPacketSink).
+// For fakePacketSink, ReadPacket respects ctx, so cancel alone suffices.
 func TestBridgeCloseOrdering(t *testing.T) {
 	bulkIn := newFakeBulkReader()
 	bulkOut := &fakeBulkWriter{}
-	tun := newFakeTUN(1)
+	sink := newFakePacketSink()
 
-	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	bridge := New(sink, bulkIn, bulkOut, 1500, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	bridge.Start(ctx)
 
-	// Correct order: cancel context → close TUN → bridge.Stop
+	// Cancel context → close sink → bridge.Stop
 	cancel()
-	tun.Close()
+	sink.Close()
 
 	done := make(chan struct{})
 	go func() {
@@ -365,31 +325,24 @@ func TestBridgeCloseOrdering(t *testing.T) {
 
 	select {
 	case <-done:
-		// Stop returned — goroutines exited cleanly
 	case <-time.After(3 * time.Second):
-		t.Fatal("Stop deadlocked — did you close TUN before Stop?")
-	}
-
-	// Verify bridge can't be started again after Stop
-	if err := bridge.Start(ctx); err != nil {
-		// Expected: Start after Stop should be a no-op (or error)
-		// The current implementation treats it as no-op (returns nil)
+		t.Fatal("Stop deadlocked")
 	}
 }
 
 // TestRelayContextCancel verifies that cancelling the context stops both
-// goroutines cleanly (with TUN close to unblock tunToModem).
+// goroutines cleanly.
 func TestRelayContextCancel(t *testing.T) {
 	bulkIn := newFakeBulkReader()
 	bulkOut := &fakeBulkWriter{}
-	tun := newFakeTUN(1)
+	sink := newFakePacketSink()
 
-	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	bridge := New(sink, bulkIn, bulkOut, 1500, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	bridge.Start(ctx)
 
 	cancel()
-	tun.Close() // unblock tunToModem
+	sink.Close() // unblock sinkToModem
 
 	done := make(chan struct{})
 	go func() {
@@ -400,7 +353,7 @@ func TestRelayContextCancel(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("Bridge did not stop after context cancel + TUN close")
+		t.Fatal("Bridge did not stop after context cancel + sink close")
 	}
 }
 
@@ -408,9 +361,9 @@ func TestRelayContextCancel(t *testing.T) {
 func TestConcurrentRelayRace(t *testing.T) {
 	bulkIn := newFakeBulkReader()
 	bulkOut := &fakeBulkWriter{}
-	tun := newFakeTUN(1)
+	sink := newFakePacketSink()
 
-	bridge := New(tun, bulkIn, bulkOut, 0, 1500, true)
+	bridge := New(sink, bulkIn, bulkOut, 1500, true)
 	ctx, cancel := context.WithCancel(context.Background())
 	bridge.Start(ctx)
 
@@ -434,7 +387,7 @@ func TestConcurrentRelayRace(t *testing.T) {
 		for i := 0; i < 20; i++ {
 			pkt := makeIPv4Packet(128 + i)
 			select {
-			case tun.rx <- pkt:
+			case sink.rx <- pkt:
 			case <-ctx.Done():
 				return
 			}
@@ -443,7 +396,7 @@ func TestConcurrentRelayRace(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 	cancel()
-	tun.Close()
+	sink.Close()
 	bridge.Stop()
 	wg.Wait()
 }
@@ -452,15 +405,15 @@ func TestConcurrentRelayRace(t *testing.T) {
 func TestRelayStats(t *testing.T) {
 	bulkIn := newFakeBulkReader()
 	bulkOut := &fakeBulkWriter{}
-	tun := newFakeTUN(1)
+	sink := newFakePacketSink()
 
-	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	bridge := New(sink, bulkIn, bulkOut, 1500, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	bridge.Start(ctx)
 
 	// Push 3 TX packets
 	for i := 0; i < 3; i++ {
-		tun.rx <- makeIPv4Packet(64)
+		sink.rx <- makeIPv4Packet(64)
 	}
 	// Push 2 RX packets
 	for i := 0; i < 2; i++ {
@@ -481,7 +434,7 @@ func TestRelayStats(t *testing.T) {
 	}
 
 	cancel()
-	tun.Close()
+	sink.Close()
 	bridge.Stop()
 }
 
@@ -489,9 +442,9 @@ func TestRelayStats(t *testing.T) {
 func TestStartIdempotent(t *testing.T) {
 	bulkIn := newFakeBulkReader()
 	bulkOut := &fakeBulkWriter{}
-	tun := newFakeTUN(1)
+	sink := newFakePacketSink()
 
-	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	bridge := New(sink, bulkIn, bulkOut, 1500, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -502,7 +455,7 @@ func TestStartIdempotent(t *testing.T) {
 		t.Fatalf("second Start: %v", err)
 	}
 
-	tun.Close()
+	sink.Close()
 	bridge.Stop()
 }
 
@@ -510,9 +463,9 @@ func TestStartIdempotent(t *testing.T) {
 func TestStopWithoutStart(t *testing.T) {
 	bulkIn := newFakeBulkReader()
 	bulkOut := &fakeBulkWriter{}
-	tun := newFakeTUN(1)
+	sink := newFakePacketSink()
 
-	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	bridge := New(sink, bulkIn, bulkOut, 1500, false)
 	bridge.Stop() // should be a no-op, no panic
 }
 
@@ -520,18 +473,18 @@ func TestStopWithoutStart(t *testing.T) {
 func TestRelayBulkWriteError(t *testing.T) {
 	bulkIn := newFakeBulkReader()
 	bulkOut := &errorBulkWriter{}
-	tun := newFakeTUN(1)
+	sink := newFakePacketSink()
 
-	bridge := New(tun, bulkIn, bulkOut, 0, 1500, false)
+	bridge := New(sink, bulkIn, bulkOut, 1500, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	bridge.Start(ctx)
 
 	// Push a packet — bulkOut.Write will fail, relay should log and continue
-	tun.rx <- makeIPv4Packet(64)
+	sink.rx <- makeIPv4Packet(64)
 	time.Sleep(100 * time.Millisecond)
 
 	cancel()
-	tun.Close()
+	sink.Close()
 	bridge.Stop()
 
 	// Verify relay didn't crash (Stats accessible)
