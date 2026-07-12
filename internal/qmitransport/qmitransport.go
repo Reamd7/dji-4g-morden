@@ -100,17 +100,26 @@ type QMITransport struct {
 	// intrDone is closed when the interrupt goroutine exits, so Close can wait.
 	intrDone chan struct{}
 
-	// deadline is set by SetReadDeadline and checked by Read. Zero value means
-	// no deadline (block indefinitely).
+	// deadline is set by SetReadDeadline and checked by Read. Both are called
+	// sequentially by readLoop (single goroutine), so no concurrent access —
+	// deadlineMu is kept for defensive safety.
 	deadlineMu sync.Mutex
 	deadline   time.Time
 
-	// writeMu serializes Write control transfers (gousb.Control is not
-	// guaranteed concurrent-safe on the same device handle).
-	writeMu sync.Mutex
-
-	// closed guards against double-Close and use-after-close.
-	mu     sync.Mutex
+	// ioMu serializes ALL USB control transfers (Read's GET, Write's SEND,
+	// Close's DTR-clear + handle-release) and protects the closed flag.
+	//
+	// This is the core concurrency guard for model B. gousb v1.1.3 has no
+	// Device.ControlContext — control transfers block with no context cancel.
+	// Close MUST acquire ioMu before releasing USB handles to guarantee no
+	// in-flight dev.Control is left dangling. Without this, the QMI client's
+	// Close order (conn.Close() at client.go:336 BEFORE wg.Wait() at :337)
+	// would release handles while writerLoop's Write or readLoop's GET is
+	// still executing → segfault (issue/001 class).
+	//
+	// Lock ordering: ioMu is the only USB-serializing mutex. deadlineMu is
+	// never held simultaneously with ioMu. No deadlock possible.
+	ioMu   sync.Mutex
 	closed bool
 }
 
@@ -239,14 +248,11 @@ func (t *QMITransport) interruptLoop() {
 // The deadline is set by the QMI client's readLoop via SetReadDeadline
 // (100ms with DefaultClientOptions). On deadline expiry, Read returns a
 // timeout error so readLoop can check its close channel and loop.
+//
+// Concurrency: the control GET is protected by ioMu. If Close acquires
+// ioMu first (setting closed=true and releasing handles), Read will see
+// closed=true once it gets the lock and return without touching USB.
 func (t *QMITransport) Read(buf []byte) (int, error) {
-	t.mu.Lock()
-	if t.closed {
-		t.mu.Unlock()
-		return 0, fmt.Errorf("qmitransport: read on closed transport")
-	}
-	t.mu.Unlock()
-
 	// Read the deadline set by SetReadDeadline.
 	t.deadlineMu.Lock()
 	dl := t.deadline
@@ -266,6 +272,11 @@ func (t *QMITransport) Read(buf []byte) (int, error) {
 	select {
 	case <-t.notifyCh:
 		// RESPONSE_AVAILABLE — fetch the QMUX frame via control GET.
+		t.ioMu.Lock()
+		defer t.ioMu.Unlock()
+		if t.closed {
+			return 0, errClosed
+		}
 		n, err := t.ctrl.Control(bmReqClassIn, reqGetEncap, 0x0000, uint16(t.ifaceNum), buf)
 		if err != nil {
 			return n, fmt.Errorf("qmitransport: GET_ENCAPSULATED_RESPONSE: %w", err)
@@ -276,23 +287,18 @@ func (t *QMITransport) Read(buf []byte) (int, error) {
 		return 0, errTimeout{}
 
 	case <-t.readCtx.Done():
-		return 0, fmt.Errorf("qmitransport: transport closed")
+		return 0, errClosed
 	}
 }
 
 // Write implements qmi.Transport.Write. It sends a QMUX frame via
 // SEND_ENCAPSULATED_COMMAND control transfer.
 func (t *QMITransport) Write(buf []byte) (int, error) {
-	t.mu.Lock()
+	t.ioMu.Lock()
+	defer t.ioMu.Unlock()
 	if t.closed {
-		t.mu.Unlock()
-		return 0, fmt.Errorf("qmitransport: write on closed transport")
+		return 0, errClosed
 	}
-	t.mu.Unlock()
-
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-
 	n, err := t.ctrl.Control(bmReqClassOut, reqSendEncap, 0x0000, uint16(t.ifaceNum), buf)
 	if err != nil {
 		return n, fmt.Errorf("qmitransport: SEND_ENCAPSULATED_COMMAND: %w", err)
@@ -317,26 +323,40 @@ func (t *QMITransport) SetReadDeadline(t2 time.Time) error {
 // Close releases the USB interface, stops the interrupt goroutine, and
 // clears DTR.
 //
-// readCancel fires FIRST, cancelling the long-blocking interrupt read so
-// the goroutine exits cleanly before USB handles are released. This mirrors
-// the AT transport's Close ordering (issue/001).
+// Concurrency model (issue/001 hardening for model B):
+//
+// The QMI client calls conn.Close() (client.go:336) BEFORE wg.Wait() (:337),
+// so writerLoop and readLoop may still be in-flight when Close runs. Since
+// gousb v1.1.3 has no Device.ControlContext, control transfers (Read's GET,
+// Write's SEND) cannot be cancelled by context — Close MUST wait for them
+// to finish before releasing USB handles.
+//
+// Solution: Close holds ioMu for its entire duration. Any in-flight Read
+// (holding ioMu during GET) or Write (holding ioMu during SEND) blocks Close
+// until they complete. Once Close gets ioMu, it sets closed=true (preventing
+// new operations), stops the interrupt goroutine, and safely releases handles.
+//
+// The interrupt goroutine does NOT use ioMu (it only does intrIn.ReadContext
+// + channel send), so readCancel + <-intrDone proceed without deadlock while
+// Close holds ioMu.
 func (t *QMITransport) Close() error {
-	t.mu.Lock()
+	t.ioMu.Lock()
+	defer t.ioMu.Unlock()
+
 	if t.closed {
-		t.mu.Unlock()
 		return nil
 	}
 	t.closed = true
-	t.mu.Unlock()
 
-	// Cancel the interrupt read so the goroutine exits before we release USB.
+	// Stop the interrupt goroutine. Safe while holding ioMu: the goroutine
+	// doesn't use ioMu — it only does intrIn.ReadContext + channel send.
 	if t.readCancel != nil {
 		t.readCancel()
 	}
-	// Wait for the interrupt goroutine to exit.
 	<-t.intrDone
 
-	// Clear DTR (best-effort, ignore errors — device may be gone).
+	// All USB control transfers are now guaranteed idle (ioMu held).
+	// Clear DTR (best-effort).
 	if t.dev != nil {
 		_, _ = t.dev.Control(bmReqClassOut, reqSetCtrlLine, 0x0000, uint16(t.ifaceNum), nil)
 	}
@@ -368,6 +388,9 @@ func (t *QMITransport) Close() error {
 	}
 	return nil
 }
+
+// errClosed is returned by Read/Write when the transport has been Closed.
+var errClosed = fmt.Errorf("qmitransport: transport closed")
 
 // errTimeout is returned by Read when the deadline expires. It implements
 // the timeout interface so os.IsTimeout returns true, which the QMI client's

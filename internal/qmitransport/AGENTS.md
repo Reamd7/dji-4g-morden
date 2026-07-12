@@ -1,6 +1,6 @@
 # internal/qmitransport/ — QMI USB transport (model B: EP0 control encapsulation)
 
-> 实现 `plans/stage2/02-qmitransport-impl.md`。
+> 实现 `plans/stage2/02-qmitransport-impl.md` + `03-read-close-concurrency.md`。
 > Phase 0 探针结果见 `plans/stage2/00-phase0-transport-probe.md`。
 
 ## 作用
@@ -30,22 +30,44 @@ interruptLoop:
   signal notifyCh (buffered=1)
     ↓
 Read():
-  select { notifyCh → dev.Control(GET) | timer(deadline) → errTimeout | readCtx.Done() → closed }
+  select { notifyCh → ioMu → dev.Control(GET) | timer(deadline) → errTimeout | readCtx.Done() → errClosed }
 ```
 
 - **零 cancel_transfer**:readCtx 只在 Close 时 cancel 一次,正常运行期不 cancel
 - **deadline 纯 Go 实现**:用 timer + channel select,不在 USB 层设超时
 - `errTimeout` 实现 `Timeout() bool` → `os.IsTimeout` 返回 true → readLoop 正常轮询 closeCh
 
+### 并发安全(子计划 03,ioMu 序列化)
+
+**核心问题**:QMI client 的 Close 顺序是 `close(closeCh) → conn.Close() → wg.Wait()`
+(client.go:335-337)。`conn.Close()` 在 `wg.Wait()` **之前**执行,意味着 writerLoop
+和 readLoop 可能还在跑。gousb v1.1.3 无 `Device.ControlContext` — 控制传输无法被
+context cancel。如果 Close 释放 USB handle 时有 in-flight `dev.Control`,segfault。
+
+**修复**:单个 `ioMu` 互斥锁序列化**所有** `dev.Control` 调用 + handle 释放:
+
+```
+Read:    select notifyCh → ioMu.Lock → closed? → ctrl.Control(GET) → Unlock
+Write:   ioMu.Lock → closed? → ctrl.Control(SEND) → Unlock
+Close:   ioMu.Lock → closed=true → readCancel → <-intrDone → DTR clear → release handles → Unlock
+```
+
+Close 持有 ioMu 的整个期间,任何 in-flight Read/Write 要么已完成(已 Unlock),要么
+在等 ioMu(拿到后看到 closed=true 就返回)。中断 goroutine 不用 ioMu(只做
+`intrIn.ReadContext` + channel send),所以 `readCancel` + `<-intrDone` 不会死锁。
+
+**硬件压测**:10 轮并发 Read+Write+Close,0 segfault(issue/001 窗口已关闭)。
+
 ### 与 AT transport(usbtransport.go)的对比
 
 | | ATTransport (MI_02) | QMITransport (MI_04) |
 |---|---|---|
 | 模型 | bulk IN/OUT 长阻塞读 | EP0 控制封装(interrupt + GET) |
-| Read | `in.ReadContext(ctx, buf)` 直接返回字节 | `select notifyCh → dev.Control(GET)` 两步 |
-| Write | `out.Write(buf)` bulk OUT | `dev.Control(SEND)` |
+| Read | `in.ReadContext(ctx, buf)` 直接返回字节 | `select notifyCh → ioMu → dev.Control(GET)` |
+| Write | `out.Write(buf)` bulk OUT | `ioMu → dev.Control(SEND)` |
+| Close 并发 | 无 writerLoop(AT 单线程写) | **有 writerLoop**(QMI 独立 writerLoop goroutine) |
+| 并发保护 | `mu`(closed 标记) | **`ioMu`**(序列化所有 dev.Control + handle 释放) |
 | DTR | 不需要 | **必须**(否则模组不响应) |
-| cancel 风险 | 低(只有 bulk IN transfer) | 低(只有 interrupt IN transfer) |
 
 ## 接口
 
@@ -55,28 +77,30 @@ func Open() (*QMITransport, error)                              // VID 0x2C7C, P
 func OpenWithVIDPID(vid, pid uint16) (*QMITransport, error)
 func (t *QMITransport) Read(buf []byte) (int, error)           // 阻塞,等 interrupt + GET
 func (t *QMITransport) Write(buf []byte) (int, error)          // SEND_ENCAPSULATED
-func (t *QMITransport) Close() error                            // cancel goroutine → 清 DTR → 释放
+func (t *QMITransport) Close() error                            // ioMu → closed → cancel → DTR → release
 func (t *QMITransport) SetReadDeadline(t time.Time) error       // 存 deadline 给 Read timer
 ```
 
 ## 可测性
 
 `controlDevice` 和 `interruptReader` 接口抽象了 gousb 的 `*Device.Control` 和
-`*InEndpoint.ReadContext`,mock 测试不需要真 USB(子计划 04)。
+`*InEndpoint.ReadContext`,mock 测试不需要真 USB。
 
 gousb v1.1.3 **没有 `Device.ControlContext`** — 控制传输无 context cancel。
 但 GET 只在 interrupt 通知后才发(数据已就绪),设备立即响应,不会长阻塞。
+并发安全靠 `ioMu` 互斥锁(不是 context cancel)。
 
 ## 测试
 
 | 文件 | 类型 | 命令 |
 |---|---|---|
+| `qmitransport_test.go` | 离线 mock | `go test -race ./internal/qmitransport/` |
 | `qmitransport_hardware_test.go` | 硬件(build tag: hardware) | `go test -tags=hardware ./internal/qmitransport/` |
 
-烟测:`TestHardwareSyncExchange` 发 SYNC → 收 SYNC_RESP,验证完整 model B 链路。
+离线测试:50 轮并发 Read+Write+Close(-race 无告警)、timeout/close/happy-path。
+硬件烟测:SYNC → SYNC_RESP + 10 轮并发 Close 压测(0 segfault)。
 
 ## 下一步
 
-- **子计划 03**:Read/Close 并发安全审计(当前已遵循方向 F,但需 formal review)
-- **子计划 04**:mock 单测(mock controlDevice + interruptReader)
+- **子计划 03**:✅ 完成(ioMu 并发安全 + 硬件压测)
 - **子计划 05**:接入 qmi.NewClientFromTransport + WDA/WDS 拨号
