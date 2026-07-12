@@ -104,52 +104,40 @@
 - TUN 上网(阶段 3):`qmidial -dial -tun` 端到端跑通——curl http://www.baidu.com HTTP 200(0.287s)、curl --interface <IPv4> HTTP 200(0.082s)、ping baidu.com 61-78ms、nslookup 经 4G DNS `<DNS1>` 解析成功(4 IP)。relay TX 1384 pkts/230KB + RX 1079 pkts/372KB(真实双向数据)。**三阶段在 macOS 全部闭环,零内核驱动**
 - **DarwinConfigurator 修复(macOS netcfg)**:`third_party/quectel-qmi-go/netcfg/darwin.go` 三处适配——(1) `SetIPAddress` IPv4 延迟到 `AddDefaultRoute`:utun 是 point-to-point 且无主地址,`inet alias` 与纯 `inet IP/PREFIX` 均失败(utun 只配得上 inet6),改为记 v4addr,在 AddDefaultRoute 用 `ifconfig utun inet LOCAL DEST`(point-to-point,dest=gateway);(2) `AddDefaultRoute` 用 `0/1`+`128/1` split 覆盖 default:macOS 已有 en0 的 default 路由,`route add default` 报 "File exists" 静默失败,split 比 default 更具体且不动现有路由,FlushRoutes 删除即可恢复;(3) 路由用 `-iface`(link-direct,point-to-point 无需 ARP gateway)
 
-### 下一步:TUN + netstack 双数据后端(2026-07-13 规划)
+### Stage 4:TUN + netstack 双数据后端(2026-07-13 代码完成,待硬件验证)
 
-三阶段路线图在 **Windows + macOS 上全程跑通**(AT+短信+QMI拨号+TUN上网,零内核驱动)。macOS(darwin/arm64)三阶段全部验证通过(brew libusb + 默认 clang,无需 Zadig/无需卸内核驱动)。
+三阶段路线图在 **Windows + macOS 上全程跑通**。Stage 4 引入 gVisor netstack 作为 TUN 的替代数据后端——**无需 admin、纯 Go、零平台特异代码**。代码和模拟测试已完成,硬件端到端验证待设备可用后进行。
 
-**macOS 适配改动(2026-07-12)已完成并 Windows 回归验证通过**:
-- `.mise.toml` Tera `os()` 条件;`usbtransport` 单例 context;`netcfg/darwin` point-to-point IPv4 + split 路由;`qmidial` 平台适配;`dns.go` DNS restore;`.githooks/pre-commit` 跨平台
-
-**新方向:引入 gVisor netstack 作为 TUN 的替代数据后端。** 调研结论见 `docs/performance/02-tun-alternatives.md`。核心思路:
-
+**架构**:
 ```
-方案 1(-tun):     App → OS TCP/IP → TUN → relay → USB → modem    (已有,需 admin,透明)
-方案 2(-socks5):  App → SOCKS5 → netstack → channel → USB → modem  (新增,无需 admin,需配代理)
+qmidial -dial -tun       # 方案 1:TUN 透明上网(需 admin)          — 已有,已验证
+qmidial -dial -socks5    # 方案 2:SOCKS5 代理(无需 admin)         — 新增,代码完成
 ```
+两个后端共享同一个 QMI transport + datapath,通过 `PacketSink` 接口切换最后一跳。
 
-两个后端共享同一个 QMI transport + datapath,通过 `DataSink` 接口切换:
+**代码结构**(新增/改动):
+- `internal/qmidatapath/sink.go` — `PacketSink` 接口(ReadPacket/WritePacket/Name/Close)
+- `internal/qmidatapath/tun_sink.go` — `TUNPacketSink`(包装 wireguard/tun.Device)
+- `internal/qmidatapath/netstack_sink.go` — `NetstackPacketSink`(gVisor channel link layer + dialer)
+- `internal/qmidatapath/socks5.go` — `RunSOCKS5`(armon/go-socks5 包装)
+- `internal/qmidatapath/relay.go` — Bridge 从 `tunDevice` 解耦到 `PacketSink`
+- `cmd/qmidial/main.go` — `-socks5` / `-socks5-addr` flag + netstack 模式集成
 
-```go
-type DataSink interface {
-    InjectPacket(pkt []byte) error  // modem → 后端
-    ReadPacket() ([]byte, error)    // 后端 → modem
-    Close() error
-}
-```
+**测试**: 21 个测试通过(mock,无需硬件)。full suite 11 包 0 失败,-race clean。
 
-- **TUN 后端**(已有):全系统透明上网,需要 admin
-- **netstack + SOCKS5 后端**(新增):纯 Go 用户态 TCP/IP,无需 admin,支持多设备负载均衡
+**gVisor 版本**: `v0.0.0-20250503011706-39ed1f5ac29c`(wireproxy 同版本,已知可编译)
+- 注意:gVisor 最新版(v0.0.0-20260711)有模块打包 bug(bridge_test.go 包冲突 + .tmpl.s 模板文件),不可用
 
-**netstack 方案的核心价值**:
-- 无需 admin、无需 TUN、无需改路由表——macOS 开发场景不再 sudo
-- 纯 Go,零平台特异代码——跨平台完全统一
-- 多设备杀手级用例:N 个模块 → N 个 netstack → N 个 SOCKS5 端口或单端口负载均衡/轮换
-- 天然隔离,不影响主网络
+**待硬件验证**:
+1. `qmidial.exe -dial -socks5` → 启动 SOCKS5 代理
+2. `curl --socks5-hostname 127.0.0.1:1080 http://www.baidu.com` → HTTP 200
+3. macOS `qmidial -dial -socks5`(无需 sudo)
 
-**gVisor netstack**(`gvisor.dev/gvisor/pkg/tcpip`):Google 纯 Go 用户态 TCP/IP 栈,link layer 支持 Go channel(不是 TUN)。文档:https://gvisor.dev/docs/architecture_guide/networking/
-
-**实施路线**:
-1. 抽象 `DataSink` 接口,重构现有 relay 对接
-2. 导入 gVisor netstack,创建 channel link endpoint
-3. SOCKS5 server(`armon/go-socks5` 或手写)
-4. DNS 解析(netstack 内置或 114.114.114.114)
-5. 多设备支持(按 USB serial 枚举全部模块,各自独立 netstack 实例)
-
-**相关调研文档**:
-- `docs/performance/01-qcusbwwan-reverse-engineering.md` — 官方驱动逆向 + QMAP/韧性/异步等可迁移设计思想
-- `docs/performance/02-tun-alternatives.md` — TUN 替代方案对比 + 多设备场景分析
-- `docs/11-quectel-driver-mbb-mechanism.md` — 官方驱动「移动数据」面板机制(IF_TYPE_WWANPP)
+**相关文档**:
+- `docs/performance/01-qcusbwwan-reverse-engineering.md` — 官方驱动逆向 + 设计思想
+- `docs/performance/02-tun-alternatives.md` — TUN 替代方案 + 多设备场景
+- `docs/performance/03-dual-backend-implementation-plan.md` — 双后端实施计划
+- `docs/11-quectel-driver-mbb-mechanism.md` — 官方驱动「移动数据」面板机制
 - `docs/12-voice-call-feasibility.md` — 语音通话可行性分析(未创建,待探测后写)
 
 ### 探索性记录:语音通话(低优先级,2026-07-13)
