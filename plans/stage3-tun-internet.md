@@ -103,29 +103,29 @@ Linux 驱动设了 `FLAG_SEND_ZLP`:当 TX URB 长度是 bulk OUT EP maxPacketSiz
 ```
 internal/
 ├── qmitransport/
-│   ├── qmitransport.go           # 现有
+│   ├── qmitransport.go           # 现有(信令,EP0+intr 0x89)
 │   ├── bulkendpoints.go          # 新增:OpenBulkEndpoints() 返回 EP 0x88/0x05
 │   └── ...
-├── tunbridge/                    # 新增 package
-│   ├── tunbridge.go              # Bridge 结构体 + Start/Stop 生命周期
+├── qmidatapath/                  # 新增 package(数据中继)
+│   ├── bridge.go                 # Bridge 结构体 + Start/Stop 生命周期
 │   ├── relay.go                  # 双向中继(bulk IN→TUN, TUN→bulk OUT)
-│   ├── relay_test.go             # mock 单测(注入 mock BulkReader/Writer + fake TUN)
+│   ├── relay_test.go             # mock 单测(注入 fake BulkReader/Writer + fake TUN)
 │   └── relay_hardware_test.go    # 硬件集成测试(build tag: hardware)
 └── ...
 cmd/
 ├── qmidial/                      # 现有,扩展:加 -tun 标志启动 TUN + relay
-└── bulkprobe/                    # 新增:阶段 3 Phase 0 数据探针
+└── bulkprobe/                    # 新增:阶段 3 门控探针
 ```
 
-预计新增代码量:**~250-300 行**(relay ~100 + bulkendpoints ~30 + tunbridge ~50 + 探针 ~50 + 测试)。
+预计新增代码量:**~300-350 行**(relay ~100 + bulkendpoints ~30 + bridge ~50 + DNS ~40 + 探针 ~50 + 测试)。
 
 ## 子计划索引
 
 | # | 子计划 | 依赖 | 状态 | 文件 |
 |---|---|---|---|---|
 | 00 | Phase 0 — bulk EP 数据探针 | 阶段 2 完成 | 待实现(头号风险门控) | `00-bulk-ep-data-probe.md` |
-| 01 | TUN + DataTransport + Relay 实现 | 00 通过 | 待实现 | `01-tun-datapath-impl.md` |
-| 02 | qmidial 集成 + 网络配置 | 01 | 待实现 | `02-integration.md` |
+| 01 | TUN + relay 实现 | 00 通过 | 待实现 | `01-tun-datapath-impl.md` |
+| 02 | qmidial 集成 + 网络配置 + DNS | 01 | 待实现 | `02-integration.md` |
 | 03 | 测试(mock + 硬件) | 02 | 待实现 | `03-tests.md` |
 | 04 | 文档 + 提交(收尾) | 03 | 待实现 | `04-docs-and-commit.md` |
 
@@ -133,10 +133,10 @@ cmd/
 
 ```mermaid
 graph TD
-  00[00 bulk EP 数据探针] -->|raw IP 确认| 01
+  00[00 bulk EP 数据探针] -->|raw IP 确认 + ZLP 结论| 01
   00 -->|WDA SetDataFormat 确认| 01
   01[01 TUN + Relay 实现] --> 02
-  02[02 qmidial 集成] --> 03
+  02[02 qmidial 集成 + DNS] --> 03
   03[03 测试] --> 04
   04[04 文档收尾]
 ```
@@ -151,18 +151,41 @@ graph TD
 `golang.zx2c4.com/wireguard/tun`:
 - WireGuard 官方 TUN 层,三平台(Linux/macOS/Windows)
 - Layer-3(裸 IP,无以太网头)——与 modem raw-IP 格式完全匹配
-- Windows 用 Wintun.dll(需额外下载放在 exe 旁,~60KB)
+- Windows 用 Wintun.dll(需额外下载放在 exe 旁,~40KB)
 - macOS 用 utun(内核内置)
 - Linux 用 /dev/net/tun(内核内置)
 - API: `CreateTUN(name, mtu)` → `Device{Read, Write, Name, MTU, Close}`
-- Read/Write 用 `[][]byte` 批量接口,offset=4(macOS 需要 4 字节 headroom)
+- Read/Write 用 `[][]byte` 批量接口,offset=4(macOS 需要 4 字节 headroom,三平台通用)
+- Windows BatchSize()=1(单包处理);Linux/macOS 可批量
+
+### Bridge 依赖注入(可测性)
+
+TUN 设备作为 `tunDevice` 接口注入 Bridge,而非 Bridge 内部创建:
+```go
+func New(tun tunDevice, bulkIn BulkReader, bulkOut BulkWriter, offset, mtu int, zlp bool) *Bridge
+```
+- **测试时**:注入 fake TUN(channel-based mock),relay 逻辑完全离线可测,不需要管理员权限/Wintun.dll
+- **生产时**:调用方先 `tun.CreateTUN(name, mtu)`,再把 Device 传入 Bridge
+- `zlp bool` 从子计划 00 探针 D2 结果取(探针驱动的参数化)
 
 ### WDA 分配(阶段 2 遗留修复)
 
 阶段 3 必须设 `cfg.Device.NetInterface = tunName`:
 - `shouldAllocateWDA()` → true → 分配 WDA service
 - `enableRawIP()` → `wda.SetDataFormat(LinkProtocolIP, agg=disabled)` → modem 切 raw-IP
-- `configureNetwork()` → netcfg 在 TUN 接口上设 IP/路由/MTU/DNS
+- `configureNetwork()` → netcfg 在 TUN 接口上设 IP/路由/MTU
+
+### netcfg 逐函数评估(本轮调研)
+
+| netcfg 函数 | Linux | Windows | macOS | 阶段 3 用途 |
+|---|---|---|---|---|
+| `SetIPAddress` | ✅ netlink | ✅ netsh | ✅ ifconfig | TUN 配 IP |
+| `AddDefaultRoute` | ✅ netlink | ✅ netsh(gwmetric=1) | ✅ route | 默认路由 |
+| `SetMTU` | ✅ ip link | ✅ netsh | ✅ ifconfig | MTU=1500 |
+| `BringUp` | ✅ ip link set up | ✅ netsh admin=enable | ✅ ifconfig up | 启接口 |
+| **`UpdateDNS`** | ✅ 直写 resolv.conf | ❌ **`return error` stub** | ❌ **`return nil` no-op** | **DNS 配置** |
+
+**DNS 必须自建**(子计划 02):Windows `netsh interface ip set dns` / macOS `networksetup -setdnsservers` / Linux `resolvectl` 或直写 resolv.conf。
 
 ### QMAP vs raw-IP
 
@@ -170,33 +193,31 @@ graph TD
 - 格式最简单:bulk EP 上的数据 = 裸 IP,直接中继到 TUN
 - `enableRawIP` 已实现(LinkProtocolIP + agg disabled)
 - 不需要 QMAP 的多路复用(单 PDN 足够)
+- Linux 驱动确认 EC25 默认 `qmap_mode=0`(raw-IP)
 
-如果 modem 不支持 raw-IP(需要 QMAP),降级方案:
-- bulk EP 数据带 QMAP 头(1-4 字节):需要 strip/add 头部
-- 或用 WDA SetQMAPSettings + WDS BindMuxDataPort 配置 QMAP mode
-
-### 网络配置
-
-利用现有 `netcfg` 包:
-- Windows: `netsh interface ip set address name="<tun>" static <ip> <mask>`
-- Linux: `ip addr add <ip>/<prefix> dev <tun>`
-- macOS: `ifconfig <tun> <ip> <peer> up`
-
-netcfg 已有 SetIPAddress/AddDefaultRoute/SetMTU/UpdateDNS,manager.configureNetwork() 自动调用。
+如果探针发现非 raw-IP(首字节 0x00-0x7f = mux_id),降级方案(relay 加 4 字节头处理):
+- RX(modem→TUN):剥 `[mux_id(1)][flags(1)][pkt_len_be16(2)]` 头,取 IP payload
+- TX(TUN→modem):加 4 字节头,mux_id=0x81(单 PDN),pkt_len = IP 包长度(大端)
+- 子计划 01 §六有完整 strip/add 代码
 
 ### 并发安全
 
 bulk EP 的 Read/Write 与 QMI 控制面(EP0+interrupt)**使用不同 endpoint,无竞争**。
 relay goroutine 只操作 bulk EP,QMITransport 的 ioMu 只保护 EP0 control transfer。
-不需要额外同步。
 
-Close 时:先 cancel relay context(stop relay goroutines),再走 QMITransport.Close()。
+**Close 时序(严格,防 segfault)**:
+1. `Bridge.Stop()` → cancel relay context → 等两个 goroutine 退出(`wg.Wait()`)
+2. `QMITransport.Close()` → 释放 USB iface
+
+绝不能反过来——释放 iface 时 relay 还在读写 bulk EP → segfault(issue/001 类)。
 
 ### 权限要求
 
-- **Windows**:管理员权限(创建 Wintun 适配器需要)
-- **macOS**:root(创建 utun + ifconfig 需要)
-- **Linux**:CAP_NET_ADMIN(创建 TUN + 配置 IP 需要)
+| 平台 | 权限 | 原因 |
+|---|---|---|
+| Windows | 管理员 | 创建 Wintun 适配器 + netsh 配 IP/DNS |
+| macOS | root(sudo) | 创建 utun + ifconfig + networksetup |
+| Linux | root 或 CAP_NET_ADMIN | 创建 TUN + ip addr/route |
 
 ## 平台前置
 

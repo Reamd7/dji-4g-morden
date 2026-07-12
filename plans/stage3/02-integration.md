@@ -1,157 +1,170 @@
-# 子计划 02 — qmidial 集成 + 网络配置
+# 子计划 02 — qmidial 集成 + 网络配置 + DNS
 
-> 隶属 `plans/stage3-tun-internet.md`(总览)。依赖子计划 01 完成。
-> 创建于 2026-07-12。
+> 隶属 `plans/stage3-tun-internet.md`(总览)。把 TUN+relay 串进拨号流程,配 IP/路由/DNS,实现端到端上网。
+> 依赖子计划 01(Bridge 可用)。
 
-## 目标
+---
 
-把 TUN + relay 集成到 `cmd/qmidial`,实现完整的"USB → QMI → WDS → TUN → 上网"链路。
-端到端验证:通过 TUN 能 ping 通外网。
+## 一、目标
 
-## 依赖 / 前置
+把 TUN 创建 + relay 启动串进现有 `cmd/qmidial/`,加 `-tun` 标志。拨号成功后:
+1. 创建 TUN 网卡(wireguard/tun)
+2. 启动 Bridge(relay 双向中继)
+3. 配置 IP/路由/MTU(netcfg,manager.configureNetwork 自动)
+4. **配置 DNS(自建——netcfg.UpdateDNS 在 Windows/macOS 不可用)**
 
-- **子计划 01 完成**:tunbridge 包可构建
-- `wintun.dll` 已放置(Windows)
-- 管理员权限运行
+最终:`qmidial -dial -tun` 一条命令完成拨号+上网,系统 ping/curl 走 4G。
 
-## 步骤
+---
 
-### 1. 修改 `cmd/qmidial/main.go`
+## 二、qmidial 扩展
 
-新增 `-tun` 标志,启用 TUN + relay:
-
-```
-mise exec -- go run ./cmd/qmidial -dial -tun
-```
-
-流程变更:
-
-```
-[1/8] Open QMITransport (MI_04)           ← 现有
-[2/8] Create QMI client                    ← 现有
-[3/8] Create TUN device                    ← 新增
-[4/8] Create manager (cfg.NetInterface=tun)← 修改
-[5/8] Start core (WDA + WDS allocation)    ← 现有,但现在会分配 WDA
-[6/8] Connect (WDS StartNetwork + configureNetwork)
-      → netcfg 在 TUN 上设 IP/路由/DNS     ← 现有 configureNetwork,目标变成 TUN
-[7/8] Open bulk endpoints + start relay    ← 新增
-[8/8] Verify: ping through TUN             ← 新增
-```
-
-### 2. TUN 创建时机
-
-TUN 必须在 `mgr.StartCoreContext()` 之前创建,因为:
-- `cfg.Device.NetInterface` 必须指向已存在的接口
-- `shouldAllocateWDA()` 检查 `NetInterface != ""`
-- `configureNetwork()` 在 `Connect()` 中设 IP 到该接口
+### 2.1 -tun 标志
 
 ```go
-// Step 3: Create TUN
-tunName := "dji0"
-if runtime.GOOS == "darwin" {
-    tunName = "utun"
-} else if runtime.GOOS == "windows" {
-    tunName = "DJI Modem"
+var tunMode = flag.Bool("tun", false, "create TUN + start relay for actual internet")
+```
+
+### 2.2 时序(关键)
+
+TUN 必须在 `mgr.Connect()` 之前创建,因为 `configureNetwork` 会向 `cfg.Device.NetInterface` 配 IP:
+
+```
+1. transport = qmitransport.Open()
+2. client = qmi.NewClientFromTransport(...)
+3. tunDev = tun.CreateTUN("qmi0", 1500)           ← 先创建 TUN
+4. tunName, _ = tunDev.Name()                       ← 取实际名(macOS 可能是 utunN)
+5. cfg.Device.NetInterface = tunName                ← 设到 manager config
+6. mgr = manager.NewWithClient(cfg, nil, client)
+7. mgr.StartCoreContext(ctx)                        ← WDA 分配 + enableRawIP(modem 切 raw-IP)
+8. mgr.Connect()                                    ← WDS StartNetwork + configureNetwork(配 TUN 的 IP/路由/MTU)
+9. bulkIn, bulkOut = transport.OpenBulkEndpoints()
+10. zlp := true                                     ← 子计划 00 D2 结果
+11. offset := 0; if runtime.GOOS == "darwin" { offset = 4 }
+12. bridge = qmidatapath.New(tunDev, bulkIn, bulkOut, offset, 1500, zlp)
+13. bridge.Start(ctx)
+14. configureDNS(tunName, dns1, dns2)               ← 自建(§三)
+15. 等 Ctrl-C
+16. bridge.Stop() → tunDev.Close() → transport.Close()
+```
+
+### 2.3 manager.configureNetwork 自动配 IP/路由
+
+设 `cfg.Device.NetInterface = tunName` 后,manager 的 `configureNetwork`(`manager.go:3414`)自动:
+- `netcfg.BringUp(tunName)` — 启动接口
+- `netcfg.SetIPAddress(tunName, settings.IPv4Address, prefix)` — 设 IP
+- `netcfg.AddDefaultRoute(tunName, settings.IPv4Gateway)` — 设默认路由
+- `netcfg.SetMTU(tunName, 1500)` — 设 MTU
+- `netcfg.SetIPv6Address(...)` — 双栈
+
+**netcfg 的 IP/路由/MTU/BringUp 三平台可用**(见总览 netcfg 评估表)。无需改 manager/netcfg 的这部分。
+
+---
+
+## 三、DNS 配置(自建,netcfg 不足)
+
+### 3.1 问题
+
+**本轮调研发现** `netcfg.UpdateDNS` 三平台现状:
+- Linux:写 `/etc/resolv.conf`(直写,不整合 systemd-resolved)
+- **Windows:`return error` stub**(缺 ifname,设计缺陷)
+- **macOS:`return nil` no-op**(注释说 skip system-wide DNS)
+
+manager.configureNetwork 调 `netcfg.UpdateDNS(dns1, dns2)` 时 Windows 会 Warn 但不致命。DNS 必须自己配。
+
+### 3.2 实现(`cmd/qmidial/dns.go` 或内联)
+
+dns1/dns2 从 `mgr.Settings().IPv4DNS1/DNS2` 取(阶段 2 拨号拿到)。
+
+**Windows**:
+```go
+exec.Command("netsh", "interface", "ip", "set", "dns",
+    "name="+tunName, "static", dns1, "primary").Run()
+exec.Command("netsh", "interface", "ip", "add", "dns",
+    "name="+tunName, dns2, "index=2").Run()
+```
+
+**macOS**:
+```go
+// network service 名需先探测(通常 "Ethernet" 或 "Wi-Fi")
+exec.Command("networksetup", "-setdnsservers", service, dns1, dns2).Run()
+```
+
+**Linux**:
+```go
+// 检测 systemd-resolved:若 /etc/resolv.conf 是 symlink
+if isSymlink("/etc/resolv.conf") {
+    exec.Command("resolvectl", "dns", tunName, dns1, dns2).Run()
+} else {
+    // 直写 resolv.conf(netcfg 已做,但可覆盖)
 }
-bridge, err := tunbridge.New(tunName, 1500, nil, nil) // bulk EPs opened later
-// ...
-actualName, _ := bridge.Name()
-
-// Step 4: Create manager with TUN interface name
-cfg := manager.Config{
-    APN: *apn,
-    Device: manager.ModemDevice{NetInterface: actualName},
-    EnableIPv4: true,
-    EnableIPv6: true,
-}
 ```
 
-### 3. Bulk EP 打开 + relay 启动时机
+### 3.3 DNS 清理
 
-在 `mgr.Connect()` 成功之后(modem 已开始发数据):
+断开时恢复 DNS:
+- Windows:`netsh interface ip set dns name="<tun>" source=dhcp`(TUN 删除后自动)
+- macOS:`networksetup -setdnsservers <service> empty`
+- Linux:恢复原 resolv.conf
 
-```go
-// Step 7: Open bulk endpoints and start relay
-bulkIn, bulkOut, err := transport.OpenBulkEndpoints()
-if err != nil { /* ... */ }
-bridge.SetBulkEndpoints(bulkIn, bulkOut) // 注入实际 endpoints
-bridge.Start(ctx)
-fmt.Printf("Relay active: bulk EP ↔ TUN %s\n", actualName)
-```
+---
 
-Bridge 的构造函数先创建 TUN(不需要 bulk EP),然后通过 setter 注入 bulk EP。
+## 四、Wintun.dll 分发(Windows)
 
-### 4. 网络配置(manager.configureNetwork)
+### 4.1 下载
 
-manager 的 `configureNetwork()` 会自动:
-1. `netcfg.BringUp(ifname)` — 启动 TUN 接口
-2. `netcfg.SetIPAddress(ifname, ip, prefix)` — 设 IP
-3. `netcfg.AddDefaultRoute(ifname, gateway)` — 设默认路由
-4. `netcfg.SetMTU(ifname, mtu)` — 设 MTU
-5. `netcfg.UpdateDNS(dns1, dns2)` — 设 DNS
+从 https://www.wintun.net/ 下载 ZIP,取 `bin/amd64/wintun.dll`(~40KB,已签名)。
 
-**Windows 验证**:
-```bash
-# 验证 TUN 接口存在且有 IP
-netsh interface ip show config name="DJI Modem"
-ipconfig | findstr "DJI Modem" -A 5
+### 4.2 方案
 
-# 验证路由
-route print -4 | findstr "0.0.0.0"
+**方案 A(简单,首选)**:随 exe 放同目录。wintun-go 用 `LoadLibraryEx("wintun.dll", ...)` 按标准搜索路径找(exe 同目录优先)。
 
-# 验证 DNS
-netsh interface ip show dns
-```
+**方案 B(embed,可选)**:`go:embed` 嵌入 DLL,运行时释放临时路径 + 显式 LoadLibraryEx。更自包含但更复杂。
 
-**Linux 验证**:
-```bash
-ip addr show dji0
-ip route show
-cat /etc/resolv.conf
-```
+阶段 3 用**方案 A**。
 
-### 5. ping 验证
+### 4.3 管理员权限
 
-通过 TUN 接口 ping 外网:
+Windows 创建 Wintun 适配器需管理员权限。qmidial 启动时检查并提示"请以管理员身份运行"。
 
-```go
-// Step 8: Verify connectivity
-// Windows: ping -n 3 8.8.8.8
-// Linux/macOS: ping -c 3 -I <tun> 8.8.8.8
-```
+---
 
-注意:ping 可能需要几秒建立 ARP/NDP(虽然是点对点 TUN,不需要 ARP)。
-默认路由指向 TUN 后,所有流量走 TUN → relay → modem → 互联网。
+## 五、权限要求
 
-**⚠️ 风险**:设默认路由后,如果 relay 不通,主机的网络会中断(所有流量走 TUN 但 TUN 不通)。
-**缓解**:
-- 初始测试用 `ping -S <tun-ip>` 或 `ping -I <tun>` 指定接口,不设默认路由
-- 或者用 `cfg.NoRoute = true` 跳过默认路由设置,手动指定路由
-- 确认 relay 正常后再设默认路由
+| 平台 | 权限 | 原因 |
+|---|---|---|
+| Windows | 管理员 | 创建 Wintun 适配器 + netsh 配 IP/DNS |
+| macOS | root(sudo) | 创建 utun + ifconfig + networksetup |
+| Linux | root 或 CAP_NET_ADMIN | 创建 TUN + ip addr/route |
 
-### 6. 清理
+---
 
-```go
-defer func() {
-    bridge.Stop()       // 停 relay + 关 TUN
-    transport.Close()   // 释放 USB
-}()
-```
+## 六、完成标志
 
-## 交付物 / 完成标志
+- [ ] `cmd/qmidial/main.go` 加 `-tun` 标志
+- [ ] TUN 创建 + Bridge 启动 + IP/路由自动配(manager.configureNetwork)
+- [ ] DNS 三平台自建(Windows netsh / macOS networksetup / Linux resolvectl)
+- [ ] Windows wintun.dll 分发(同目录)
+- [ ] 端到端:`qmidial -dial -tun` → 系统 `ping 8.8.8.8` 走 4G 成功
+- [ ] DNS 解析:`nslookup baidu.com` 通过
 
-- [ ] `-tun` 标志工作:创建 TUN + WDA 分配 + 拨号 + relay 启动
-- [ ] TUN 接口有运营商 IP(`ipconfig` / `ip addr` 可见)
-- [ ] 通过 TUN ping 通外网(`ping 8.8.8.8` 通过)
-- [ ] DNS 解析工作(`nslookup baidu.com` 通过)
-- [ ] Clean shutdown(Stop relay → close TUN → close USB,无崩溃)
+---
 
-## 风险
+## 七、风险
 
 | 风险 | 缓解 |
 |---|---|
-| 默认路由抢走主机网络 | 初始测试用 `-noroute`,确认 relay 后再设默认路由 |
-| netcfg 的 netsh 在 Wintun 适配器上失败 | 降级:用 winipcfg(LUID API)直接配置 |
-| WDA SetDataFormat 在 configureNetwork 前未完成 | manager.StartCore 中 enableRawIP 在 StartNetwork 之前,顺序正确 |
-| DNS 不通 | 用运营商 DNS 或公共 DNS(114.114.114.114 / 8.8.8.8) |
-| ping 超时 | LTE 延迟较高(50-200ms),设 5s 超时 |
+| TUN 创建时序 vs configureNetwork | 先 CreateTUN 再 Connect;macOS 用 `tunDev.Name()` 取实际名设回 cfg |
+| 默认路由与主网卡冲突 | 初始测试用 `cfg.NoRoute=true` + 手动 ping 指定接口,确认 relay 后再设默认路由 |
+| macOS utun 改名,configureNetwork 配错名 | `tunDev.Name()` 取实际名,设回 `cfg.Device.NetInterface` 后再 Connect |
+| Windows DNS netsh 需要接口名匹配 | 用 TUN `Name()` 返回值;netsh 按名找 |
+| 默认路由设后 relay 不通 → 主机断网 | 先不设默认路由,手动 `ping -S <tun-ip>` 确认 relay;再放开 |
+
+---
+
+## 八、相关文件
+
+- `cmd/qmidial/main.go` — 现有,扩展 -tun
+- `internal/qmidatapath/bridge.go` — 子计划 01,Bridge
+- `third_party/quectel-qmi-go/manager/manager.go` — configureNetwork(:3414)
+- `third_party/quectel-qmi-go/netcfg/` — SetIPAddress/AddDefaultRoute/SetMTU 可用,UpdateDNS 不足

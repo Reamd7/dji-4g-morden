@@ -1,79 +1,101 @@
 # 子计划 04 — 文档 + 提交(阶段 3 收尾)
 
-> 隶属 `plans/stage3-tun-internet.md`(总览)。阶段 3 最后一步。
-> 创建于 2026-07-12。
+> 隶属 `plans/stage3-tun-internet.md`(总览)。阶段 3 最后一步:记录实测结果 + 提交。
+> 依赖子计划 03(测试通过)。
 
-## 目标
+---
 
-把阶段 3 的实测结论写入项目长期记忆(AGENTS.md + docs),git commit。
+## 一、目标
 
-## 依赖 / 前置
+把阶段 3 的实测结论(数据格式、relay 验证、上网结果、ZLP 结论、DNS 自建)写入项目长期记忆
+(AGENTS.md + 子目录 AGENTS.md + docs),解除 `docs/01` 的阶段 3 风险,git commit。
 
-- **子计划 03 完成**:测试全过,端到端 ping + DNS 验证通过
+---
 
-## 步骤
+## 二、更新文档
 
-### 1. 更新 `AGENTS.md`
+### 2.1 主 `AGENTS.md`
 
-#### 实测记录段补"阶段 3 完成":
+实测记录段补"阶段 3 完成":
+- **数据格式确认**(子计划 00):bulk EP 承载 raw-IP / QMAP(实测结果);WDA SetDataFormat 在 QDC507 上成功/失败
+- **ZLP 结论**(子计划 00 D2):512 倍数包是否需手动 ZLP
+- **relay 实现**(子计划 01):`internal/qmidatapath/`,双向 goroutine,raw-IP 直传 / QMAP 剥头
+- **DNS 自建**(子计划 02):netcfg.UpdateDNS 在 Windows/macOS 不可用,自建 netsh/networksetup/resolvectl
+- **上网验证**(子计划 03):ping 8.8.8.8 + nslookup 走 4G 成功
+- **三阶段全部完成**:纯用户态 USB → AT+短信 → QMI 拨号 → TUN 上网,零内核驱动
 
-- TUN 库:`golang.zx2c4.com/wireguard/tun`
-- bulk EP 数据格式确认:raw IP(版本 nibble 4/6)
-- WDA SetDataFormat 在 QDC507 上成功(LinkProtocol=0x02)
-- relay 双向工作:bulk IN 0x88 → TUN / TUN → bulk OUT 0x05
-- 端到端:ping + DNS 通过
-- Wintun.dll 集成(Windows)
-- 网络配置:netcfg 在 TUN 接口上设 IP/路由/DNS
+目录结构段补:
+- `internal/qmidatapath/`(新包)
+- `internal/qmitransport/bulkendpoints.go`(新文件)
+- `cmd/bulkprobe/`(新工具)
+- `wintun.dll`(Windows 分发,如入库)
 
-#### 目录结构补:
+依赖段补:
+- `golang.zx2c4.com/wireguard`(TUN)
+- `golang.zx2c4.com/wintun`(Windows,隐式)
 
-- `internal/tunbridge/` — TUN + relay
-- `cmd/bulkprobe/` — Phase 0 数据探针
-- `wintun.dll`(gitignored 或文档说明放置位置)
+### 2.2 子目录 AGENTS.md
 
-#### 依赖列表补:
+- **新建** `internal/qmidatapath/AGENTS.md`:
+  - 包职责(TUN↔bulk relay)
+  - Bridge 生命周期(New 注入 → Start → Stop)
+  - raw-IP 直传 / QMAP 降级
+  - ZLP 参数化(探针驱动)
+  - Close 时序(Stop relay → QMITransport.Close)
+  - 不做的事(不做 TCP/IP 栈,不做路由,不做 DNS)
+- **更新** `internal/qmitransport/AGENTS.md`:加 bulkendpoints.go 说明
+  - OpenBulkEndpoints(EP 0x88/0x05)
+  - 与 ioMu 关系(同锁防 Close 竞争,但 bulk 操作不经 ioMu)
+  - 与 QMI 控制面共享 MI_04 claim,不同 endpoint 无竞争
 
-- `golang.zx2c4.com/wireguard/tun`
+### 2.3 `docs/01` 风险解除
 
-### 2. 更新 `internal/tunbridge/AGENTS.md`
+- §8.2 QMI 数据格式(raw-IP vs QMAP):标记 ✅ 已解除(实测结果)
+- §六阶段 3:标记完成
 
-记忆点:
-- relay 设计(offset=4,批量 vs 单包,IP version 校验)
-- BulkReader/BulkWriter 接口(测试注入)
-- Bridge 生命周期(New → SetBulkEndpoints → Start → Stop)
-- 并发安全(relay goroutines vs QMITransport ioMu,不同 endpoint 无竞争)
+---
 
-### 3. 更新 `docs/01`
+## 三、提交
 
-- §六阶段 3:标"已完成",补实测结论
-- §八风险 §8.2 QMI 数据格式:状态更新为"已解除"
+git commit(会触发 `.githooks/pre-commit` 跑 `go test -race ./internal/...`)。
 
-### 4. 更新 `internal/qmitransport/AGENTS.md`
+提交信息模板:
+```
+stage3: TUN virtual NIC + actual internet (Stage 3 milestone)
 
-补 `OpenBulkEndpoints()` 方法说明:
-- bulk IN EP 0x88 / bulk OUT EP 0x05
-- 与 QMI 控制面(EP0+interrupt)共享 MI_04 claim,不同 endpoint 无竞争
+阶段 3 完成:QMI bulk EP ↔ TUN 双向 raw IP 中继,实现真实上网。
 
-### 5. git commit
+internal/qmitransport/bulkendpoints.go: OpenBulkEndpoints (EP 0x88/0x05)
+internal/qmidatapath/: Bridge + 双向 relay (TUN↔bulk) + ZLP + QMAP fallback
+cmd/bulkprobe/: 阶段 3 门控探针 (WDA + raw-IP 确认 + ZLP 测试)
+cmd/qmidial -tun: 端到端上网 + DNS 自建
 
-```bash
-git add -A
-git commit  # pre-commit hook 跑 go test -race ./internal/...
+实测:数据格式=raw-IP,WDA=OK,relay 双向,ping+DNS 走 4G 成功
+零内核驱动,三阶段全部完成。
 ```
 
-commit message 概述:阶段 3 TUN 虚拟网卡 + 实际上网完成(bulk EP relay + TUN + 端到端验证)。
+---
 
-## 交付物 / 完成标志
+## 四、完成标志
 
-- [ ] AGENTS.md 补阶段 3 实测记录
-- [ ] internal/tunbridge/AGENTS.md 创建
-- [ ] docs/01 阶段 3 标记完成 + §8.2 风险解除
+- [ ] AGENTS.md 实测记录 + 目录结构 + 依赖更新
+- [ ] internal/qmidatapath/AGENTS.md 新建
 - [ ] internal/qmitransport/AGENTS.md 补 OpenBulkEndpoints
-- [ ] git commit 成功(pre-commit hook 通过)
+- [ ] docs/01 §8.2 风险解除
+- [ ] git commit(pre-commit race 通过)
+- [ ] **阶段 3 全部完成:纯用户态 USB → 上网链路打通**
 
-## 风险
+---
 
-| 风险 | 缓解 |
-|---|---|
-| pre-commit hook 失败 | 子计划 03 的 mock 测试必须先全过 |
-| 文档遗漏实测数据 | 子计划 00/02/03 的输出(bulk EP 确认/ping 结果/崩溃测试)逐项核对 |
+## 五、项目整体里程碑
+
+阶段 3 完成后,`docs/01` 的三阶段路线图全部达成:
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| 1 | AT 通道 + 短信 | ✅(USB transport + smscodec + AT 命令全集) |
+| 2 | QMI 通道 + 拨号 | ✅(model B + DTR + manager + IPv6 双栈) |
+| 3 | TUN 虚拟网卡 + 上网 | ✅(本计划) |
+
+**核心目标达成**:纯用户态、跨平台(Win/macOS/Linux)、不依赖 Quectel 厂商驱动的
+DJI 百望 4G 模组完整能力(短信 + 上网)。零内核驱动,Windows 上全程跑通。

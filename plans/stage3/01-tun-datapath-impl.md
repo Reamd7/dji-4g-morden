@@ -1,260 +1,244 @@
-# 子计划 01 — TUN + DataTransport + Relay 实现
+# 子计划 01 — TUN + relay 实现
 
-> 隶属 `plans/stage3-tun-internet.md`(总览)。依赖子计划 00 通过。
-> 创建于 2026-07-12。
+> 隶属 `plans/stage3-tun-internet.md`(总览)。**阶段 3 核心**(数据中继层)。
+> 依赖子计划 00 通过(raw-IP 确认 + WDA 确认 + ZLP 结论)。
 
-## 目标
+---
 
-实现 USB bulk EP ↔ TUN 的双向 raw IP 中继层。
+## 一、目标
 
-## 依赖 / 前置
+新建 `internal/qmidatapath/` 包,实现 TUN 虚拟网卡与 QMI bulk endpoint 之间的双向 raw IP 中继。上游 quectel-qmi-go 没有这层(依赖内核 qmi_wwan),纯用户态必须自己写。
 
-- **子计划 00 通过**:bulk EP 确认承载 raw IP 数据
-- `golang.zx2c4.com/wireguard/tun` 依赖已添加
-- Windows: `wintun.dll` 已放置
+---
 
-## 步骤
+## 二、依赖
 
-### 1. 添加 TUN 库依赖
+- **子计划 00 通过**:raw-IP 确认(首字节 IP version=4/6)。如果探针发现是 QMAP,本计划 §六加 strip/add 层。
+- **子计划 00 D2 ZLP 结论**:`zlp bool` 传入 Bridge 配置
+- 引入 `golang.zx2c4.com/wireguard/tun`
 
 ```bash
-mise exec -- go get golang.zx2c4.com/wireguard/tun
+mise exec -- go get golang.zx2c4.com/wireguard
 ```
 
-这会拉入:
-- `golang.zx2c4.com/wireguard`(tun 包)
-- `golang.zx2c4.com/wintun`(Windows only,自动)
+模块 `golang.zx2c4.com/wireguard`,子包 `tun`。Windows 隐式依赖 `golang.zx2c4.com/wintun`(运行时需 wintun.dll)。
 
-### 2. `internal/qmitransport/bulkendpoints.go`(子计划 00 已创建)
+---
 
-如果 00 已创建,此处跳过。否则创建 `OpenBulkEndpoints()` 方法。
-
-### 3. `internal/tunbridge/tunbridge.go`
-
-Bridge 结构体,管理 TUN + relay 生命周期:
+## 三、TUN API 关键点
 
 ```go
-package tunbridge
-
-import (
-    "context"
-    "fmt"
-    "sync"
-
-    "golang.zx2c4.com/wireguard/tun"
-)
-
-// Bridge relays raw IP packets between a USB bulk endpoint pair and a TUN
-// device. Both sides are layer-3 (no ethernet header), so packets pass
-// through unchanged.
-type Bridge struct {
-    tun    tun.Device
-    relay  *Relay
-    cancel context.CancelFunc
-    done   chan struct{}
+type Device interface {
+    Read(bufs [][]byte, sizes []int, offset int) (n int, err error)
+    Write(bufs [][]byte, offset int) (int, error)
+    Name() (string, error)
+    MTU() (int, error)
+    Events() <-chan Event
+    Close() error
+    BatchSize() int
 }
-
-// New creates a TUN device and prepares the relay. The bulk reader/writer
-// are injected (testability). MTU is set on the TUN at creation.
-func New(tunName string, mtu int, bulkIn BulkReader, bulkOut BulkWriter) (*Bridge, error) {
-    dev, err := tun.CreateTUN(tunName, mtu)
-    if err != nil {
-        return nil, fmt.Errorf("tunbridge: create TUN: %w", err)
-    }
-    name, err := dev.Name()
-    if err != nil {
-        dev.Close()
-        return nil, fmt.Errorf("tunbridge: get TUN name: %w", err)
-    }
-
-    return &Bridge{
-        tun:   dev,
-        relay: NewRelay(bulkIn, bulkOut, dev),
-        done:  make(chan struct{}),
-    }, nil
-}
-
-// Name returns the actual TUN interface name (may differ from requested,
-// e.g. macOS "utun" → "utun7").
-func (b *Bridge) Name() (string, error) {
-    return b.tun.Name()
-}
-
-// Start launches the bidirectional relay goroutines.
-func (b *Bridge) Start(parent context.Context) {
-    ctx, cancel := context.WithCancel(parent)
-    b.cancel = cancel
-    go func() {
-        defer close(b.done)
-        b.relay.Run(ctx)
-    }()
-}
-
-// Stop signals the relay to stop and waits for goroutines to exit.
-// Then closes the TUN device.
-func (b *Bridge) Stop() {
-    if b.cancel != nil {
-        b.cancel()
-    }
-    <-b.done
-    b.tun.Close()
-}
+func CreateTUN(ifname string, mtu int) (Device, error)
 ```
 
-### 4. `internal/tunbridge/relay.go`
+- **批量接口**:`bufs [][]byte`,`sizes []int`。Read 返回包数 n,长度写 sizes[0..n-1]
+- **offset**:macOS utun 需 4 字节 headroom(protocol family 头),用 offset=4;Linux/Windows offset=0。三平台用 4 通用安全
+- **Windows BatchSize()=1**:每次只读/写 1 个包,relay 按单包处理(跨平台一致)
+- **macOS 命名不受控**:传 "qmi0" 被改成 "utunN",配置时用 `Device.Name()` 实际返回值
 
-双向中继,两个 goroutine:
+---
+
+## 四、包结构
+
+```
+internal/qmidatapath/
+├── bridge.go          # Bridge 结构体 + Start/Stop 生命周期
+├── relay.go           # 双向中继(bulk IN→TUN, TUN→bulk OUT)
+├── relay_test.go      # mock 单测(注入 fake BulkReader/Writer + fake TUN)
+└── relay_hardware_test.go  # 硬件集成测试(build tag: hardware)
+```
+
+---
+
+## 五、实现
+
+### 5.1 接口抽象(可测性,对齐 usbtransport/qmitransport 模式)
 
 ```go
-package tunbridge
+package qmidatapath
 
-import (
-    "context"
-    "log"
-    "runtime"
+import "context"
 
-    "golang.zx2c4.com/wireguard/tun"
-)
-
-// BulkReader abstracts a USB bulk IN endpoint (gousb *InEndpoint satisfies this).
+// BulkReader abstracts the gousb IN endpoint (EP 0x88). gousb *InEndpoint satisfies this.
 type BulkReader interface {
     ReadContext(ctx context.Context, buf []byte) (int, error)
 }
 
-// BulkWriter abstracts a USB bulk OUT endpoint (gousb *OutEndpoint satisfies this).
+// BulkWriter abstracts the gousb OUT endpoint (EP 0x05). gousb *OutEndpoint satisfies this.
 type BulkWriter interface {
-    WriteContext(ctx context.Context, buf []byte) (int, error)
+    Write(buf []byte) (int, error)
 }
 
-// offset for TUN Read/Write. macOS needs >= 4 (AF-family prefix headroom).
-// 4 is safe on all platforms.
-const tunOffset = 4
+// tunDevice abstracts wireguard/tun.Device for testing.
+type tunDevice interface {
+    Read(bufs [][]byte, sizes []int, offset int) (int, error)
+    Write(bufs [][]byte, offset int) (int, error)
+    Name() (string, error)
+    Close() error
+    BatchSize() int
+}
+```
 
-// Relay bidirectionally forwards raw IP between USB bulk EPs and a TUN device.
-type Relay struct {
+### 5.2 Bridge 结构体
+
+```go
+type Bridge struct {
+    tun     tunDevice      // 注入(非内部创建),测试时用 fake TUN
     bulkIn  BulkReader
     bulkOut BulkWriter
-    tun     tun.Device
+    offset  int            // macOS=4, 其他=0
+    mtu     int            // 1500
+    zlp     bool           // 子计划 00 D2 结果:是否需 ZLP
+
+    cancel  context.CancelFunc
+    wg      sync.WaitGroup
+    mu      sync.Mutex
+    started bool
 }
 
-func NewRelay(bulkIn BulkReader, bulkOut BulkWriter, tun tun.Device) *Relay {
-    return &Relay{bulkIn: bulkIn, bulkOut: bulkOut, tun: tun}
-}
+// New creates a Bridge. tun/bulkIn/bulkOut must be pre-opened. offset from
+// runtime.GOOS (macOS=4). zlp from subplan 00 D2 probe result.
+func New(tun tunDevice, bulkIn BulkReader, bulkOut BulkWriter, offset, mtu int, zlp bool) *Bridge
 
-// Run starts both relay directions and blocks until ctx is cancelled.
-func (r *Relay) Run(ctx context.Context) {
-    var wg sync.WaitGroup
-    wg.Add(2)
+// Start launches the two relay goroutines (TUN→modem, modem→TUN). Idempotent.
+func (b *Bridge) Start(ctx context.Context) error
 
-    // TUN → modem (uplink)
-    go func() {
-        defer wg.Done()
-        r.tunToModem(ctx)
-    }()
+// Stop cancels the relay context and waits for both goroutines to exit.
+// Does NOT close the TUN — caller owns TUN lifecycle.
+func (b *Bridge) Stop() error
+```
 
-    // modem → TUN (downlink)
-    go func() {
-        defer wg.Done()
-        r.modemToTun(ctx)
-    }()
+**设计要点**:TUN 作为接口注入而非 Bridge 内部创建——relay 逻辑完全离线可测(不需要管理员权限/Wintun.dll)。调用方负责 `tun.CreateTUN()` + `bridge.Start()` + `bridge.Stop()` + `tun.Close()`。
 
-    wg.Wait()
-}
+### 5.3 relay 双向中继(核心 ~100 行)
 
-// tunToModem reads IP packets from TUN and writes them to bulk OUT EP.
-func (r *Relay) tunToModem(ctx context.Context) {
-    batch := r.tun.BatchSize()
-    bufs := make([][]byte, batch)
-    sizes := make([]int, batch)
+```go
+// Flow 1: TUN → modem (上行)
+func (b *Bridge) tunToModem(ctx context.Context) {
+    defer b.wg.Done()
+    batchSize := b.tun.BatchSize()
+    if batchSize < 1 { batchSize = 1 }
+    bufs := make([][]byte, batchSize)
+    sizes := make([]int, batchSize)
     for i := range bufs {
-        bufs[i] = make([]byte, tunOffset+65535)
+        bufs[i] = make([]byte, b.mtu+b.offset)
     }
-
     for {
-        n, err := r.tun.Read(bufs, sizes, tunOffset)
+        select {
+        case <-ctx.Done(): return
+        default:
+        }
+        n, err := b.tun.Read(bufs, sizes, b.offset)
         if err != nil {
             if ctx.Err() != nil { return }
-            log.Printf("tunbridge: TUN read error: %v", err)
-            return
+            log.Printf("qmidatapath: TUN read error: %v", err)
+            continue
         }
         for i := 0; i < n; i++ {
-            pkt := bufs[i][tunOffset : tunOffset+sizes[i]]
-            if _, err := r.bulkOut.WriteContext(ctx, pkt); err != nil {
+            pkt := bufs[i][b.offset : b.offset+sizes[i]]
+            if _, err := b.bulkOut.Write(pkt); err != nil {
                 if ctx.Err() != nil { return }
-                log.Printf("tunbridge: bulk OUT write error: %v", err)
+                log.Printf("qmidatapath: bulk OUT write error: %v", err)
+                continue
+            }
+            // R5 ZLP: 如果 pkt 长度是 bulk OUT maxPacketSize(512)整数倍,追加 0 字节
+            if b.zlp && len(pkt)%512 == 0 {
+                b.bulkOut.Write([]byte{})
             }
         }
     }
 }
 
-// modemToTun reads raw IP from bulk IN EP and writes to TUN.
-func (r *Relay) modemToTun(ctx context.Context) {
-    buf := make([]byte, 65535)
-    tunBuf := make([][]byte, 1)
-    tunBuf[0] = make([]byte, tunOffset+65535)
-
+// Flow 2: modem → TUN (下行)
+func (b *Bridge) modemToTun(ctx context.Context) {
+    defer b.wg.Done()
+    buf := make([]byte, 65535)  // R4: 大 buffer,一次 bulk transfer 可含完整 IP 包
+    outBuf := make([]byte, b.mtu+b.offset)
     for {
-        n, err := r.bulkIn.ReadContext(ctx, buf)
+        select {
+        case <-ctx.Done(): return
+        default:
+        }
+        n, err := b.bulkIn.ReadContext(ctx, buf)
         if err != nil {
             if ctx.Err() != nil { return }
-            log.Printf("tunbridge: bulk IN read error: %v", err)
-            return
-        }
-        if n == 0 { continue }
-
-        // Validate: first nibble must be IP version (4 or 6)
-        version := buf[0] >> 4
-        if version != 4 && version != 6 {
-            log.Printf("tunbridge: non-IP packet on bulk IN (version=%d), skipping", version)
+            log.Printf("qmidatapath: bulk IN read error: %v", err)
             continue
         }
-
-        copy(tunBuf[0][tunOffset:], buf[:n])
-        if _, err := r.tun.Write(tunBuf[:1], tunOffset); err != nil {
-            if ctx.Err() != nil { return }
-            log.Printf("tunbridge: TUN write error: %v", err)
-        }
+        if n == 0 { continue }
+        // raw-IP: 直接转发(buf[:n] 就是裸 IP 包)
+        copy(outBuf[b.offset:], buf[:n])
+        b.tun.Write([][]byte{outBuf[:b.offset+n]}, b.offset)
     }
 }
 ```
 
-### 5. 设计要点
+### 5.4 并发安全 + Close 时序
 
-#### 为什么用 offset=4
+- bulk EP 的 Read/Write 与 QMI 控制面(EP0+interrupt 0x89)**不同 endpoint,无竞争**
+- relay goroutine 只操作 bulk EP,QMITransport.ioMu 只保护 EP0 control transfer
+- **Close 时序(严格,防 segfault)**:
+  1. `Bridge.Stop()` → cancel relay context → `wg.Wait()` 等两个 goroutine 退出
+  2. `QMITransport.Close()` → 释放 USB iface
+  3. 绝不能反过来——释放 iface 时 relay 还在读写 → segfault(issue/001 类)
 
-macOS utun 内部在每帧前加 4 字节 AF-family prefix(`tun_darwin.go` 在 Read 时 strip,
-Write 时 inject)。offset=4 留出空间,三平台通用。
+---
 
-#### 为什么 modemToTun 用单 buffer 而非批量
+## 六、QMAP 降级(如果子计划 00 发现非 raw-IP)
 
-gousb 的 `ReadContext` 一次返回一个 USB transfer(一个 IP 包)。而 TUN 的 `Write` 接受
-`[][]byte` 批量。我们一次写一个包(单元素切片),足够高效——下行带宽受 LTE 限制(≤150Mbps),
-不是 USB 限制。
+如果探针发现首字节是 `0x00-0x07`(mux_id 而非 IP version),是 QMAP 模式。relay 加 strip/add 层:
 
-#### 为什么 tunToModem 用批量
+```go
+// QMAP RX 头(4字节大端):[mux_id(1)][flags(1)][pkt_len_be16(2)][IP payload]
+// RX (modem→TUN): 剥前 4 字节
+qmapPkt := buf[:n]
+if qmapPkt[0] <= 0x7f {  // mux_id, QMAP
+    pktLen := int(binary.BigEndian.Uint16(qmapPkt[2:4]))
+    ipPkt := qmapPkt[4 : 4+pktLen]
+    // 转发 ipPkt 到 TUN
+}
+// TX (TUN→modem): 加 4 字节头
+hdr := []byte{muxID, 0x00, 0x00, 0x00}
+binary.BigEndian.PutUint16(hdr[2:4], uint16(len(ipPkt)))
+bulkOut.Write(append(hdr, ipPkt...))
+```
 
-TUN 的 `Read` 可能一次返回多个包(batch)。我们对每个包单独调 `WriteContext`(一个 URB per packet)。
-未来可以优化为批量 URB,但初始版本不需要。
+muxID 来自拨号时 WDS BindMuxDataPort 分配(单 PDN 通常 0x81)。本计划默认 raw-IP,QMAP 是降级分支。
 
-#### 线程安全
+---
 
-- `tunToModem` 和 `modemToTun` 操作不同的 endpoint(OUT vs IN),无竞争
-- `tun.Read` 和 `tun.Write` 可以并发(WireGuard TUN 设计如此)
-- Close:`context.Cancel()` → 两个 goroutine 退出 → `wg.Wait()` → `tun.Close()`
+## 七、完成标志
 
-## 交付物 / 完成标志
+- [ ] `internal/qmidatapath/bridge.go` + `relay.go` 编译通过
+- [ ] mock 单测(`relay_test.go`):双向转发、ZLP、offset、Close 时序(子计划 03)
+- [ ] Bridge.Start/Stop 生命周期正确(Stop 等 goroutine 退出)
+- [ ] raw-IP 直传路径工作(子计划 00 确认格式后)
+- [ ] QMAP 降级代码就绪(如果需要)
 
-- [ ] `golang.zx2c4.com/wireguard/tun` 依赖在 go.mod
-- [ ] `internal/tunbridge/tunbridge.go` — Bridge 结构体
-- [ ] `internal/tunbridge/relay.go` — 双向中继 + BulkReader/Writer 接口
-- [ ] `go build ./...` 通过
-- [ ] `go vet ./...` 通过
+---
 
-## 风险
+## 八、风险
 
 | 风险 | 缓解 |
 |---|---|
-| Wintun.dll 缺失(Windows) | CreateTUN 会返回明确错误。文档要求放 dll |
-| TUN 接口名不匹配(macOS) | 用 `dev.Name()` 取实际名,而非构造参数 |
-| bulk Read 包粘连 | 初始方案:大 buffer + short packet 检测。如失败改固定 MTU buffer |
-| 内存拷贝开销 | relay 有一次 copy(modem→TUN)。LTE 带宽下可忽略。未来可 zero-copy |
+| bulk Read 包边界(R4):一次 Read 含多包粘连 | raw-IP 下通常每 URB=一包;若粘连按 IP 头 length 字段拆。先实测 |
+| TX ZLP(R5):512 倍数包卡 | `b.zlp` 标志从子计划 00 D2 取。gousb 0 字节 Write 行为需实测 |
+| Windows BatchSize=1 性能 | 单包循环,4G LTE Cat4(~150Mbps)够用,非瓶颈 |
+| Close 竞态 | 严格时序:Stop relay → QMITransport.Close |
+
+---
+
+## 九、相关文件
+
+- `internal/qmitransport/bulkendpoints.go` —— 子计划 00,OpenBulkEndpoints 返回的 `*gousb.InEndpoint`/`*OutEndpoint` 天然满足 BulkReader/Writer
+- `internal/qmitransport/qmitransport.go` —— iface 字段(同包 OpenBulkEndpoints 用)
+- `internal/usbtransport/usbtransport.go` —— 方向F + ioMu 模式参考(Close 时序设计)

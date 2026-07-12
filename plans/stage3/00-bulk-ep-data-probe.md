@@ -57,23 +57,28 @@ mgr.Connect()  // WDS StartNetwork → 拿 PDH + IP
 // 从 QMITransport 获取 bulk endpoints
 bulkIn, bulkOut, err := transport.OpenBulkEndpoints()
 
-// 读 5 秒
-ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// 读 8 秒(R4:大 buffer 一次 bulk transfer 可含完整 IP 包)
+ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 defer cancel()
 buf := make([]byte, 65535)
+count := 0
 for {
     n, err := bulkIn.ReadContext(ctx, buf)
     if err != nil { break }
+    if n == 0 { continue }
     pkt := buf[:n]
-    // 检查是否是 IP 包:第一个 byte 的高 4 bit = 4(IPv4)或 6(IPv6)
     version := pkt[0] >> 4
-    fmt.Printf("bulk IN: %d bytes, IP version=%d, first 20 bytes: % x\n", n, version, pkt[:min(20,n)])
+    fmt.Printf("bulk IN: %d bytes, IP version=%d, first 20 bytes: % x\n",
+        n, version, pkt[:min(20,n)])
+    count++
 }
+fmt.Printf("Read %d packets in 8s\n", count)
 ```
 
-验证:
-- 收到数据(IP 包,version=4 或 6)
-- 或者无数据(modem 不主动发包,需要先发数据触发响应)
+判断标准:
+- `version == 4`(IPv4,首字节 `0x45`)或 `version == 6`(IPv6,首字节 `0x60`)→ **raw-IP 确认** ✅
+- `version` 在 `0x00-0x07`(像 mux_id)→ **QMAP 模式**,数据有 4 字节头需剥(子计划 01 §六降级)
+- 无数据 → 走 Phase D(modem 可能不主动发包,需先触发上行)
 
 #### Phase D:触发流量(如果 Phase C 无数据)
 

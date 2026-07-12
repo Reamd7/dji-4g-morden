@@ -1,174 +1,151 @@
 # 子计划 03 — 测试(mock + 硬件)
 
-> 隶属 `plans/stage3-tun-internet.md`(总览)。依赖子计划 02 完成。
-> 创建于 2026-07-12。
+> 隶属 `plans/stage3-tun-internet.md`(总览)。依赖子计划 01(Bridge)+ 02(集成)。
 
-## 目标
+---
 
-为 tunbridge relay 层编写 mock 单测(离线,CI 友好)和硬件集成测试(需设备)。
+## 一、目标
 
-## 依赖 / 前置
+为阶段 3 数据通路层建立测试体系,对齐项目现有测试分层(AGENTS.md「测试方案」):
+- mock 单测(CI 友好,无硬件,`-race` 硬性要求)
+- 硬件集成测试(build tag `hardware`,需真实 EC25)
 
-- **子计划 02 完成**:qmidial -tun 端到端工作
-- 遵循项目测试约定(AGENTS.md):标准库 testing,手写 mock,table-driven,`-race` 硬性要求
+---
 
-## 步骤
+## 二、mock 单测(`internal/qmidatapath/relay_test.go`,无硬件)
 
-### 1. Mock 工具(`internal/tunbridge/mock_test.go`)
+用 fake BulkReader/Writer + fake tunDevice(实现接口),完全离线测试 relay 逻辑。
+**TUN 注入设计(子计划 01)使 relay 逻辑完全离线可测**——不需要管理员权限/Wintun.dll。
 
-#### MockBulkReader
+### 2.1 fake 实现
 
 ```go
-type mockBulkReader struct {
-    packets [][]byte  // 预设的下行包队列
-    idx     int
-    mu      sync.Mutex
-}
-
-func (m *mockBulkReader) ReadContext(ctx context.Context, buf []byte) (int, error) {
-    m.mu.Lock()
-    if m.idx >= len(m.packets) {
-        m.mu.Unlock()
-        <-ctx.Done()  // 队列空,阻塞到 cancel
-        return 0, ctx.Err()
+// fakeBulkReader 模拟 gousb InEndpoint,从预设 channel 吐数据
+type fakeBulkReader struct { pkts chan []byte }
+func (f *fakeBulkReader) ReadContext(ctx context.Context, buf []byte) (int, error) {
+    select {
+    case p := <-f.pkts: n := copy(buf, p); return n, nil
+    case <-ctx.Done(): return 0, ctx.Err()
     }
-    pkt := m.packets[m.idx]
-    m.idx++
-    m.mu.Unlock()
-    n := copy(buf, pkt)
-    return n, nil
 }
-```
 
-#### MockBulkWriter
-
-```go
-type mockBulkWriter struct {
-    written [][]byte  // 记录所有写入的包
+// fakeBulkWriter 记录所有写入
+type fakeBulkWriter struct {
     mu      sync.Mutex
+    written [][]byte
 }
-
-func (m *mockBulkWriter) WriteContext(ctx context.Context, buf []byte) (int, error) {
-    m.mu.Lock()
-    cp := make([]byte, len(buf))
-    copy(cp, buf)
-    m.written = append(m.written, cp)
-    m.mu.Unlock()
+func (f *fakeBulkWriter) Write(buf []byte) (int, error) {
+    f.mu.Lock(); defer f.mu.Unlock()
+    f.written = append(f.written, append([]byte(nil), buf...))
     return len(buf), nil
 }
+
+// fakeTUN 实现 tunDevice 接口,双向 channel
+type fakeTUN struct {
+    rx        chan []byte  // Read 从此读
+    tx        chan []byte  // Write 写到此
+    batchSize int
+}
+func (f *fakeTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+    select {
+    case p := <-f.rx:
+        copy(bufs[0][offset:], p)
+        sizes[0] = len(p)
+        return 1, nil
+    case <-ctx.Done(): return 0, ctx.Err()
+    }
+}
+func (f *fakeTUN) Write(bufs [][]byte, offset int) (int, error) {
+    for _, b := range bufs {
+        f.tx <- append([]byte(nil), b[offset:]...)
+    }
+    return len(bufs), nil
+}
+func (f *fakeTUN) BatchSize() int { return f.batchSize }
+func (f *fakeTUN) Name() (string, error) { return "fake0", nil }
+func (f *fakeTUN) Close() error { return nil }
 ```
 
-#### MockTUNDevice
+### 2.2 测试用例(9 个)
 
-WireGuard 的 `tun.Device` 接口 mock:
-- `Read`:从预设队列返回包
-- `Write`:记录写入的包
-- `Name`/`MTU`/`Close`/`Events`/`BatchSize`:返回固定值
-
-### 2. Mock 单测(`internal/tunbridge/relay_test.go`)
-
-#### TestRelayModemToTun
-
-验证 modem → TUN 方向:
-1. 注入 mockBulkReader(预设 3 个 IPv4 包)
-2. 注入 mockBulkWriter(不期望写入)
-3. 注入 mockTUNDevice
-4. Start relay,等包传完,cancel
-5. 断言 mockTUN 收到 3 个包,内容与预设一致
-
-#### TestRelayTunToModem
-
-验证 TUN → modem 方向:
-1. 注入 mockTUNDevice(预设 2 个 IPv4 包)
-2. 注入 mockBulkWriter(记录写入)
-3. Start relay,等包传完,cancel
-4. 断言 mockBulkWriter 收到 2 个包
-
-#### TestRelayNonIPPacketDropped
-
-验证非 IP 包被丢弃:
-1. mockBulkReader 预设一个首字节 version=0 的包
-2. relay 运行,cancel
-3. 断言 mockTUN 没收到任何包(丢弃了)
-
-#### TestRelayConcurrentClose
-
-验证 cancel 不 panic、不 deadlock:
-1. Start relay
-2. 立即 cancel context
-3. Relay 应在 ≤1s 内退出
-
-#### TestRelayIPv6Passthrough
-
-验证 IPv6 包正常中继:
-1. mockBulkReader 预设 IPv6 包(首字节 version=6)
-2. 断言 mockTUN 收到
-
-所有测试用 `-race` 跑。
-
-### 3. 硬件集成测试(`internal/tunbridge/relay_hardware_test.go`)
-
-`//go:build hardware`
-
-#### TestHardwareTUNCreateAndConfig
-
-验证 TUN 创建 + 网络配置:
-1. `tunbridge.New("DJI Modem", 1500, nil, nil)`
-2. 检查 `Name()` 返回非空
-3. 用 netcfg 设 IP: `netcfg.SetIPAddress(name, "10.0.0.1", 24)`
-4. 检查 `netsh interface ip show config` 包含该 IP
-5. `bridge.Stop()`
-
-#### TestHardwareFullDialupWithTUN
-
-完整端到端:
-1. QMITransport.Open
-2. qmi.NewClientFromTransport
-3. tunbridge.New (创建 TUN)
-4. manager.NewWithClient (cfg.NetInterface = tun name)
-5. mgr.StartCoreContext (WDA 分配 + enableRawIP)
-6. mgr.Connect (WDS StartNetwork + configureNetwork on TUN)
-7. transport.OpenBulkEndpoints
-8. bridge.SetBulkEndpoints + bridge.Start
-9. ping 8.8.8.8 通过 TUN
-10. nslookup baidu.com 通过 TUN
-11. Clean shutdown
-
-#### TestHardwareRelayBidirectional
-
-验证 relay 双向工作:
-1. 同上 1-8
-2. 发送 ICMP echo(手动构造 IP+ICMP 到 bulk OUT)
-3. 从 TUN 读,检查是否收到 ICMP reply
-4. 反向:从 TUN 写 ICMP echo,从 bulk IN 读 reply
-
-### 4. 测试命令
-
-```bash
-# 离线 mock 测试(CI)
-mise exec -- go test -race -v ./internal/tunbridge/
-
-# 硬件测试(需设备 + wintun.dll + 管理员)
-mise exec -- go test -tags=hardware -v -timeout 120s ./internal/tunbridge/
-
-# 全量
-mise exec -- go test -race ./...
-mise exec -- go test -tags=hardware -race ./...
-```
-
-## 交付物 / 完成标志
-
-- [ ] `relay_test.go`:5+ mock 测试,`-race` 通过
-- [ ] `relay_hardware_test.go`:2+ 硬件测试,`-tags=hardware` 通过
-- [ ] TUN 创建 + 网络配置验证通过
-- [ ] 端到端 ping + DNS 验证通过
-- [ ] 并发 Close 0 segfault(延续 issue/001 防护)
-
-## 风险
-
-| 风险 | 缓解 |
+| 测试 | 验证点 |
 |---|---|
-| Mock TUN Device 复杂(Device 接口方法多) | 只 mock 需要的方法,其余 panic("not implemented") |
-| 硬件测试设默认路由影响主机网络 | 用 `cfg.NoRoute=true`,手动 ping 指定接口 |
-| ping 不通但 relay 正常 | 可能 DNS 问题,先 ping IP 再 ping 域名 |
-| wintun.dll 架构不匹配 | 确认下载 amd64 版本 |
+| `TestRelayModemToTUN` | bulk IN 收到 IP 包 → TUN.Write 收到同样包(下行) |
+| `TestRelayTUNToModem` | TUN.Read 收到 IP 包 → bulkOut.Write 收到同样包(上行) |
+| `TestRelayRawIPPassthrough` | raw-IP 直传,无头处理(首字节 0x45 原样到达) |
+| `TestRelayZLP` | 512 倍数包触发 ZLP(b.zlp=true 时追加 0 字节 Write) |
+| `TestRelayOffsetMacOS` | offset=4 时 macOS headroom 正确处理(TUN 读到的数据跳过前 4 字节) |
+| `TestBridgeStopWaitsGoroutines` | Stop 等 relay goroutine 退出(不泄漏,`wg.Wait()` 生效) |
+| `TestBridgeCloseOrdering` | Stop relay → 才能 Close transport(时序,防 segfault) |
+| `TestRelayContextCancel` | ctx 取消后两个 goroutine 干净退出 |
+| `TestConcurrentRelayRace` | `-race` 下并发读写安全 |
+
+跑:`make test-race`(`-race` 硬性要求,AGENTS.md 测试约定)。
+
+---
+
+## 三、硬件集成测试(`internal/qmidatapath/relay_hardware_test.go`,build tag)
+
+```go
+//go:build hardware
+```
+
+### 3.1 测试用例
+
+| 测试 | 内容 |
+|---|---|
+| `TestHardwareBulkEndpoints` | OpenBulkEndpoints 返回非 nil(EP 0x88/0x05 可打开) |
+| `TestHardwareRelayEndToEnd` | 拨号 + TUN + relay + ping 8.8.8.8 走 4G(核心端到端) |
+| `TestHardwareRelayDNS` | DNS 解析:nslookup baidu.com 通过(验证 DNS 自建) |
+| `TestHardwareRelayZLPReal` | 真实 512 字节包是否需 ZLP(验证 R5) |
+
+### 3.2 端到端测试流程
+
+```go
+func TestHardwareRelayEndToEnd(t *testing.T) {
+    // 1. 拨号(transport + client + manager.Connect)
+    // 2. 创建 TUN
+    // 3. OpenBulkEndpoints + Bridge.Start
+    // 4. 等 IP/路由配好(configureNetwork)
+    // 5. 配 DNS(自建)
+    // 6. exec.Command("ping", "-n", "4", "8.8.8.8")  // Windows: -n, Linux/macOS: -c
+    // 7. 断言 ping 成功(loss < 100%)
+    // 8. exec.Command("nslookup", "baidu.com")       // DNS 验证
+    // 9. 断言 DNS 解析成功
+    // 10. bridge.Stop + cleanup
+}
+```
+
+成功标准:`ping 8.8.8.8` 通过 4G(loss < 100%) + `nslookup baidu.com` 解析成功。
+
+跑:
+```bash
+# 需管理员/sudo + wintun.dll(Windows)
+DJI_TEST_APN=3gnet mise exec -- go test -tags=hardware -v -run TestHardwareRelay ./internal/qmidatapath/
+```
+
+---
+
+## 四、覆盖率目标(对齐 AGENTS.md)
+
+| 层 | 目标 | 说明 |
+|---|---|---|
+| relay 适配层(qmidatapath) | ≥ 80% | mock 测,覆盖双向/ZLP/offset/Close 时序 |
+| bulkendpoints | ≥ 80% | mock 测锁/closed |
+| USB 物理层(bulk transfer) | 不计 | 硬件测试验证,不追求覆盖率 |
+
+---
+
+## 五、完成标志
+
+- [ ] `relay_test.go` 9 个 mock 测试,`-race` 通过
+- [ ] `relay_hardware_test.go` 硬件测试真实跑通(ping 8.8.8.8 + DNS 走 4G)
+- [ ] coverage relay 适配层 ≥ 80%
+
+---
+
+## 六、相关文件
+
+- `internal/qmidatapath/relay.go` — 子计划 01,被测代码
+- `internal/testutil/scriptport.go` — 现有 mock(参考模式,但 relay 用专门的 fakeBulkReader/Writer)
+- `internal/usbtransport/usbtransport_test.go` — mock 测试模式参考
