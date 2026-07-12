@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# commit-msg hook: check commit message for PII leakage.
+#
+# This hook receives the path to a temp file containing the commit message
+# as $1. It scans the message against .piipatterns (same file as pre-commit).
+# Activated via `git config core.hooksPath .githooks`.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+PII_FILE="$ROOT/.piipatterns"
+
+# If .piipatterns is missing, skip silently (pre-commit hook already warned).
+if [ ! -f "$PII_FILE" ]; then
+  exit 0
+fi
+
+# Build regex from .piipatterns (same logic as pre-commit hook).
+PII_REGEX=$(grep -v '^#' "$PII_FILE" | grep -v '^$' | paste -sd'|' -)
+
+if [ -z "$PII_REGEX" ]; then
+  exit 0
+fi
+
+# $1 is the path to the temporary file holding the commit message.
+MSG_FILE="$1"
+COMMIT_MSG=$(cat "$MSG_FILE")
+
+PII_HITS=$(echo "$COMMIT_MSG" | grep -iE "$PII_REGEX" 2>/dev/null || true)
+
+if [ -n "$PII_HITS" ]; then
+  echo "" >&2
+  echo "commit-msg: ❌ PII DETECTED in commit message — commit aborted." >&2
+  echo "" >&2
+  echo "$PII_HITS" >&2
+  echo "" >&2
+  echo "Redact these values in your commit message." >&2
+  echo "Bypass with 'git commit --no-verify' (NOT recommended for PII)." >&2
+  exit 1
+fi
+
+exit 0
