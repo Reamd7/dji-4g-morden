@@ -1,11 +1,12 @@
 // Package usbtransport wraps DJI Baiwang modem USB bulk endpoints as an
 // io.ReadWriteCloser, ready to feed into modem.NewFromIO.
 //
-// Read uses a short-timeout poll: each Read blocks at most readPollInterval
-// (200ms) and, on timeout, returns an error implementing Timeout() so the
-// modem readerLoop can wake up, observe Close, and treat the timeout as
-// nothing-to-do. This mirrors go.bug.st/serial's SetReadTimeout(200ms)
-// semantic that the upstream modem package was designed against.
+// Read blocks until data arrives or the transport is Closed — it does NOT use
+// a short-timeout poll. A 200ms poll would cancel the USB transfer every cycle
+// (~5 libusb_cancel_transfer/s), which segfaults WinUSB under send-time
+// read/write concurrency. Instead Read uses a long-lived context cancelled only
+// by Close, so the transfer stays submitted (zero cancels) during normal
+// operation. See issue/001-gousb-close-transfer-cancel-crash.md.
 package usbtransport
 
 import (
@@ -13,16 +14,9 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"time"
 
 	"github.com/google/gousb"
 )
-
-// readPollInterval bounds how long a single Read call blocks when no data
-// arrives. It mirrors the 200ms serial read timeout the modem.readerLoop was
-// designed against (see Open's SetReadTimeout in third_party/sms-gateway/modem).
-// Shorter = more responsive shutdown, more CPU; 200ms is the proven value.
-const readPollInterval = 200 * time.Millisecond
 
 // ATTransport wraps MI_02 (AT command port) USB bulk endpoints as an
 // io.ReadWriteCloser. It is the USB-side counterpart of go.bug.st/serial's
@@ -34,6 +28,14 @@ type ATTransport struct {
 	iface *gousb.Interface
 	out   endpointWriter // EP 0x03 OUT bulk (gousb *OutEndpoint)
 	in    endpointReader // EP 0x84 IN bulk  (gousb *InEndpoint)
+
+	// readCtx is a long-lived context for the IN endpoint read. It has no
+	// deadline — Read blocks until data arrives or readCancel fires on Close.
+	// This avoids the per-read libusb_cancel_transfer that a short-timeout
+	// poll would trigger (~5/s at 200ms), which segfaults WinUSB under
+	// send-time read/write concurrency. See issue/001-gousb-close-transfer-cancel-crash.md.
+	readCtx    context.Context
+	readCancel context.CancelFunc
 
 	mu     sync.Mutex
 	closed bool
@@ -96,24 +98,29 @@ func Open(vid, pid uint16, ifaceNum, epOut, epIn int) (*ATTransport, error) {
 		return nil, fmt.Errorf("usbtransport: IN endpoint 0x%02x: %w", epIn, err)
 	}
 
+	readCtx, readCancel := context.WithCancel(context.Background())
 	return &ATTransport{
-		ctx:   ctx,
-		dev:   dev,
-		cfg:   cfg,
-		iface: iface,
-		out:   out,
-		in:    in,
+		ctx:        ctx,
+		dev:        dev,
+		cfg:        cfg,
+		iface:      iface,
+		out:        out,
+		in:         in,
+		readCtx:    readCtx,
+		readCancel: readCancel,
 	}, nil
 }
 
-// Read implements io.Reader. It blocks at most readPollInterval (200ms); on
-// timeout it returns an error whose Timeout() method yields true so that
-// modem.readerLoop treats it as nothing-to-do and loops (and, critically, can
-// observe m.closed between polls).
+// Read implements io.Reader. It blocks until data arrives or the transport is
+// Closed (readCancel fires). Unlike a short-timeout poll, this never cancels
+// the underlying USB transfer during normal operation — it only cancels once,
+// at Close. This avoids the libusb_cancel_transfer segfault that a 200ms poll
+// would trigger under send-time read/write concurrency (issue/001).
 //
-// gousb's InEndpoint.ReadContext returns context.DeadlineExceeded on a context
-// deadline, which already implements Timeout() bool == true. Read passes that
-// through unchanged.
+// On Close, readCtx is cancelled; gousb returns a context.Canceled error,
+// which implements Timeout()==true, so modem.readerLoop's isTimeout() treats
+// it as nothing-to-do and the loop exits via the m.closed check on the next
+// iteration.
 func (t *ATTransport) Read(buf []byte) (int, error) {
 	t.mu.Lock()
 	if t.closed {
@@ -122,9 +129,7 @@ func (t *ATTransport) Read(buf []byte) (int, error) {
 	}
 	t.mu.Unlock()
 
-	rctx, cancel := context.WithTimeout(context.Background(), readPollInterval)
-	defer cancel()
-	return t.in.ReadContext(rctx, buf)
+	return t.in.ReadContext(t.readCtx, buf)
 }
 
 // Write implements io.Writer. It writes the full buffer to the OUT endpoint;
@@ -139,10 +144,13 @@ func (t *ATTransport) Write(buf []byte) (int, error) {
 	return t.out.Write(buf)
 }
 
-// Close releases the USB interface claim, configuration, and device. After
-// Close, any blocked Read returns an error (its context is allowed to elapse,
-// but the closed flag also gates further Read/Write). Subsequent Read/Write
-// return an error immediately.
+// Close releases the USB interface claim, configuration, and device.
+//
+// readCancel fires FIRST, before any USB handle is released, so that an
+// in-flight Read returns (its transfer is cancelled cleanly) before the
+// underlying interface/config/device/context are torn down. Releasing USB
+// handles while a transfer is still submitted would segfault libusb
+// (issue/001).
 func (t *ATTransport) Close() error {
 	t.mu.Lock()
 	if t.closed {
@@ -152,6 +160,11 @@ func (t *ATTransport) Close() error {
 	t.closed = true
 	t.mu.Unlock()
 
+	// Cancel the in-flight read so readerLoop's blocked ReadContext returns
+	// before we release the USB handles below.
+	if t.readCancel != nil {
+		t.readCancel()
+	}
 	var errs []error
 	if t.iface != nil {
 		t.iface.Close()

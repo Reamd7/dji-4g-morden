@@ -2,7 +2,6 @@ package usbtransport
 
 import (
 	"context"
-	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -49,9 +48,12 @@ func (w *scriptWriter) Write(buf []byte) (int, error) {
 // transport's blocked reads).
 func newTestTransport(response []byte) (*ATTransport, *testutil.ScriptPort) {
 	port := testutil.NewScriptPort(response)
+	readCtx, readCancel := context.WithCancel(context.Background())
 	t := &ATTransport{
-		in:  &scriptReader{port: port},
-		out: &scriptWriter{port: port},
+		in:         &scriptReader{port: port},
+		out:        &scriptWriter{port: port},
+		readCtx:    readCtx,
+		readCancel: readCancel,
 	}
 	return t, port
 }
@@ -90,32 +92,35 @@ func TestReadPartialData(t *testing.T) {
 	}
 }
 
-// TestReadTimeoutReturnsTimeoutMethod is the critical contract for
-// modem.readerLoop: when no data arrives within readPollInterval, Read must
-// return an error whose Timeout() method yields true so isTimeout() recognizes
-// it as nothing-to-do and the loop continues. context.DeadlineExceeded
-// (returned by the scriptReader on ctx.Done) satisfies this.
-func TestReadTimeoutReturnsTimeoutMethod(t *testing.T) {
+// TestReadBlocksUntilDataOrClose verifies the long-lived-read contract: with
+// no data, Read blocks indefinitely (it does NOT time out after a short poll
+// interval). The only way to unblock it is data arriving or Close. This is
+// the fix for the libusb_cancel_transfer segfault — see issue/001.
+func TestReadBlocksUntilDataOrClose(t *testing.T) {
 	tt, _ := newTestTransport(nil) // empty → ScriptPort.Read blocks
 	buf := make([]byte, 64)
 
-	done := make(chan struct{})
+	// Read must still be blocked after 300ms — no short-timeout poll.
+	blocked := make(chan struct{})
 	go func() {
-		_, err := tt.Read(buf)
-		if err == nil {
-			t.Error("Read returned nil error, want timeout")
-		}
-		var timeout interface{ Timeout() bool }
-		if !errors.As(err, &timeout) || !timeout.Timeout() {
-			t.Errorf("Read error = %v, want an error implementing Timeout()==true", err)
-		}
-		close(done)
+		_, _ = tt.Read(buf)
+		close(blocked)
 	}()
-
 	select {
-	case <-done:
+	case <-blocked:
+		t.Fatal("Read returned within 300ms — should block until data or Close")
+	case <-time.After(300 * time.Millisecond):
+		// still blocked: expected.
+	}
+
+	// Close must unblock the parked Read.
+	if err := tt.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case <-blocked:
 	case <-time.After(2 * time.Second):
-		t.Fatal("Read did not return within 2s (expected ~readPollInterval timeout)")
+		t.Fatal("Read did not return after Close (deadlock)")
 	}
 }
 
@@ -215,8 +220,10 @@ func TestConcurrentReadWrite(t *testing.T) {
 		}()
 	}
 
-	// One reader draining in parallel; port has no preloaded data so reads
-	// time out at readPollInterval, which is the realistic idle-channel case.
+	// One reader draining in parallel. With the long-lived read (direction F)
+	// and no preloaded data, this Read parks until Close cancels it — the test
+	// still exercises concurrent writes while a read is in flight, and Close
+	// cleanly unblocks the reader.
 	done := make(chan struct{})
 	go func() {
 		buf := make([]byte, 32)
@@ -248,9 +255,12 @@ func TestATTransportFeedsModemNewFromIO(t *testing.T) {
 	// This proves the ATTransport + ScriptPort plumbing drives the modem
 	// readerLoop end-to-end without any USB hardware.
 	port := testutil.NewScriptPort(nil)
+	readCtx, readCancel := context.WithCancel(context.Background())
 	tt := &ATTransport{
-		in:  &scriptReader{port: port},
-		out: &scriptWriter{port: port},
+		in:         &scriptReader{port: port},
+		out:        &scriptWriter{port: port},
+		readCtx:    readCtx,
+		readCancel: readCancel,
 	}
 	defer tt.Close()
 

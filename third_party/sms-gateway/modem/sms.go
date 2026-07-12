@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+
+	"dji-modem-research/third_party/smscodec"
 )
 
 // Initialize the modem for SMS work in PDU mode. Idempotent.
@@ -444,22 +446,145 @@ func (m *Modem) DeleteStored(ctx context.Context, index int) error {
 	_, err := m.SendAndWait(ctx, fmt.Sprintf("AT+CMGD=%d", index), 5*time.Second)
 	return err
 }
+// DeleteAllStored removes every message from the preferred message storage
+// (AT+CMGD=1,4 — <delflag>=4 deletes all regardless of status). Useful to
+// clear the SIM after bulk-reading. See EC25 AT Commands Manual §9.5.
+func (m *Modem) DeleteAllStored(ctx context.Context) error {
+	_, err := m.SendAndWait(ctx, "AT+CMGD=1,4", 10*time.Second)
+	return err
+}
 
-// Send transmits a body to recipient. We encode locally to a PDU, then issue
-// AT+CMGS=<tpduLen>, wait for the ">" prompt, send the hex PDU followed by
-// Ctrl-Z, and wait for the final OK.
-//
-// udh carries optional 8-bit concat metadata; the zero value sends a plain
-// single-part SMS (the legacy path). Non-zero udh.Total instructs EncodeSubmit
-// to emit a UDHI-flagged PDU with the IEI 0x00 header so the recipient
-// handset reassembles multi-segment sends into one balloon.
-func (m *Modem) Send(ctx context.Context, recipient, body string, udh SubmitUDH) error {
-	hexPDU, tpduLen, err := EncodeSubmit(recipient, body, udh)
+// ReadStored returns the message at the given index from the preferred
+// message storage, as a raw PDU hex string (PDU mode: AT+CMGR=<index> yields
+// "+CMGR: <stat>,[<alpha>],<length>" then "<pdu>"). The PDU can be decoded
+// with DecodeDeliver. See EC25 AT Commands Manual §9.7.
+func (m *Modem) ReadStored(ctx context.Context, index int) (StoredMessage, error) {
+	lines, err := m.SendAndWait(ctx, fmt.Sprintf("AT+CMGR=%d", index), 10*time.Second)
+	if err != nil {
+		return StoredMessage{}, err
+	}
+	for i := 0; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], "+CMGR:") && i+1 < len(lines) {
+			return StoredMessage{Index: index, PDU: strings.TrimSpace(lines[i+1])}, nil
+		}
+	}
+	return StoredMessage{}, fmt.Errorf("CMGR: no PDU in response")
+}
+
+// SMSC queries the Service Center Address (AT+CSCA?). Returns the SMSC number
+// (e.g. "+8613800100500"). Empty string if the SIM has no SMSC programmed.
+// See EC25 AT Commands Manual §9.3.
+func (m *Modem) SMSC(ctx context.Context) (string, error) {
+	lines, err := m.SendAndWait(ctx, "AT+CSCA?", 5*time.Second)
+	if err != nil {
+		return "", err
+	}
+	for _, l := range lines {
+		if !strings.HasPrefix(l, "+CSCA:") {
+			continue
+		}
+		// +CSCA: "<sca>",<tosca>  — extract the first quoted field.
+		body := strings.TrimSpace(strings.TrimPrefix(l, "+CSCA:"))
+		parts := splitCSVQuoted(body)
+		if len(parts) > 0 {
+			return strings.Trim(parts[0], `"`), nil
+		}
+	}
+	return "", nil
+}
+
+// SetCharset selects the TE character set (AT+CSCS="<charset>"). In PDU mode
+// (CMGF=0) this mainly affects text-mode command fields, not PDU contents;
+// it is provided for completeness and for USSD (AT+CUSD) preconditions.
+// See EC25 AT Commands Manual §2.24.
+func (m *Modem) SetCharset(ctx context.Context, charset string) error {
+	_, err := m.SendAndWait(ctx, fmt.Sprintf(`AT+CSCS="%s"`, charset), 5*time.Second)
+	return err
+}
+// --- Phase A: device info (vohive has CIMI + CGMR) ---
+
+// IMSI queries the International Mobile Subscriber Identity (AT+CIMI).
+// Returns the 15-digit IMSI string. See EC25 AT Commands Manual §5.1.
+func (m *Modem) IMSI(ctx context.Context) (string, error) {
+	lines, err := m.SendAndWait(ctx, "AT+CIMI", 3*time.Second)
+	if err != nil {
+		return "", err
+	}
+	for _, l := range lines {
+		s := strings.TrimSpace(l)
+		if isAllDigits(s) && len(s) >= 14 {
+			return s, nil
+		}
+	}
+	return "", errors.New("CIMI: no IMSI in response")
+}
+
+// SoftwareVersion queries the modem's software/firmware revision (AT+CGMR).
+// See EC25 AT Commands Manual §2.7.
+func (m *Modem) SoftwareVersion(ctx context.Context) (string, error) {
+	lines, err := m.SendAndWait(ctx, "AT+CGMR", 3*time.Second)
+	if err != nil {
+		return "", err
+	}
+	if len(lines) > 0 {
+		return strings.TrimSpace(lines[0]), nil
+	}
+	return "", errors.New("CGMR: empty response")
+}
+
+// --- Phase E: USSD (vohive has CUSD) ---
+
+// SendUSSD sends a USSD code (e.g. "*100#" to check balance). The response
+// arrives asynchronously as a +CUSD URC; register a handler via OnURC to
+// receive it. See EC25 AT Commands Manual §11 (Supplementary Service).
+func (m *Modem) SendUSSD(ctx context.Context, code string) error {
+	_, err := m.SendAndWait(ctx, fmt.Sprintf(`AT+CUSD=1,"%s",15`, code), 5*time.Second)
+	return err
+}
+
+// isAllDigits reports whether s consists entirely of ASCII digits.
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// Send transmits a body to recipient. The body is encoded locally (via
+// smscodec) to one or more SMS-SUBMIT PDUs; long messages are auto-split into
+// a multi-segment concatenation. Each segment drives one full AT+CMGS=<len>
+// round-trip: wait for the ">" prompt, send the hex PDU + Ctrl-Z, wait for OK.
+// Segments are paced 500 ms apart to avoid overflowing the modem's command
+// queue (a lesson from vohive's SendSMSWithOptions).
+func (m *Modem) Send(ctx context.Context, recipient, body string) error {
+	segs, err := encodeSubmitPDUs(recipient, body)
 	if err != nil {
 		return err
 	}
-	// CMGS prompts with ">" — our reader treats the prompt as a result. We
-	// then write hex + ctrl-Z directly, then need a follow-up wait for OK.
+	for i, seg := range segs {
+		if err := m.sendOneSegment(ctx, seg.hexPDU, seg.tpduLen); err != nil {
+			return fmt.Errorf("segment %d/%d: %w", i+1, len(segs), err)
+		}
+		if i < len(segs)-1 {
+			select {
+			case <-time.After(500 * time.Millisecond):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return nil
+}
+
+// sendOneSegment performs the two-step CMGS handshake for a single PDU:
+// AT+CMGS=<len> (readerLoop returns on the ">" prompt), then write the hex
+// PDU + Ctrl-Z (0x1A) and wait for the final OK/ERROR.
+func (m *Modem) sendOneSegment(ctx context.Context, hexPDU string, tpduLen int) error {
 	if _, err := m.SendAndWait(ctx, fmt.Sprintf("AT+CMGS=%d", tpduLen), 5*time.Second); err != nil {
 		return fmt.Errorf("CMGS init: %w", err)
 	}
@@ -487,4 +612,110 @@ func (m *Modem) Send(ctx context.Context, recipient, body string, udh SubmitUDH)
 	case <-m.closed:
 		return errors.New("modem closed")
 	}
+}
+// SetSMSCallback enables the +CMTI auto-receive pipeline. After this call,
+// whenever the modem emits a "+CMTI: <mem>,<index>" URC (a new SMS landed in
+// storage), the modem reads it (AT+CMGR), decodes + reassembles it (via the
+// smscodec Reassembler for long-SMS segments), invokes cb with the complete
+// message, then deletes the segment from storage (AT+CMGD). cb is invoked from
+// a dedicated goroutine, so it must not block on the modem (no SendAndWait
+// from within cb, or use a separate Modem / queue).
+//
+// Requires Initialize to have set AT+CNMI with <mt>=1 (the default
+// "2,1,0,0,0") so new messages are stored and reported via +CMTI.
+func (m *Modem) SetSMSCallback(cb SMSCallback) {
+	m.smsCbMu.Lock()
+	m.smsCb = cb
+	m.smsCbMu.Unlock()
+
+	// Register the +CMTI handler once. dispatchURC runs inside readerLoop, so
+	// the handler must NOT call SendAndWait directly (it would deadlock waiting
+	// for a response readerLoop can no longer read). Instead it dispatches the
+	// read/decode/delete sequence to a goroutine; readerLoop stays free to
+	// serve the AT+CMGR that sequence issues.
+	m.OnURC(func(line string) {
+		if !strings.HasPrefix(line, "+CMTI:") {
+			return
+		}
+		index, _ := parseCMTI(line)
+		if index <= 0 {
+			return
+		}
+		go m.handleIncomingSMS(index)
+	})
+}
+
+// handleIncomingSMS is the +CMTI auto-read pipeline, run in its own goroutine
+// (see SetSMSCallback). It reads the message PDU, decodes + reassembles it,
+// delivers it via the SMS callback, then deletes the segment. Errors are
+// logged but not surfaced (this is an asynchronous background path).
+func (m *Modem) handleIncomingSMS(index int) {
+	m.smsCbMu.Lock()
+	cb := m.smsCb
+	m.smsCbMu.Unlock()
+	if cb == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// 1. Read the message PDU.
+	sm, err := m.ReadStored(ctx, index)
+	if err != nil {
+		log.Debug().Err(err).Int("index", index).Msg("CMTI: read failed")
+		return
+	}
+	if sm.PDU == "" {
+		log.Debug().Int("index", index).Msg("CMTI: empty PDU")
+		return
+	}
+
+	// 2. Decode the PDU (strips SCA, delegates to smscodec).
+	decoded, err := DecodeDeliver(sm.PDU)
+	if err != nil {
+		log.Debug().Err(err).Int("index", index).Msg("CMTI: decode failed")
+		return
+	}
+
+	// 3. Feed the Reassembler. For single-part messages Add returns
+	//    (true, content) immediately; for long-SMS segments it accumulates
+	//    until all parts arrive.
+	var ci smscodec.ConcatInfo
+	if decoded.Concat != nil {
+		ci = smscodec.ConcatInfo{
+			IsConcat: true,
+			Ref:      decoded.Concat.Ref,
+			Total:    decoded.Concat.Total,
+			Seq:      decoded.Concat.Part,
+		}
+	}
+	complete, full := m.reassembler.Add(decoded.Sender, ci, decoded.Body)
+
+	// 4. Always delete the segment we just read (SIM space is scarce).
+	if err := m.DeleteStored(ctx, index); err != nil {
+		log.Debug().Err(err).Int("index", index).Msg("CMTI: delete failed")
+	}
+
+	// 5. Deliver once the message is complete (single-part or fully reassembled).
+	if complete {
+		cb(decoded.Sender, full, decoded.Timestamp)
+	}
+}
+
+// parseCMTI extracts the message index from a "+CMTI: <mem>,<index>" URC.
+// The storage (<mem>) is ignored — we always read from the preferred storage
+// preset by Initialize (AT+CPMS). Returns (0, "") on parse failure.
+func parseCMTI(line string) (index int, storage string) {
+	body := strings.TrimSpace(strings.TrimPrefix(line, "+CMTI:"))
+	parts := splitCSVQuoted(body)
+	if len(parts) < 2 {
+		return 0, ""
+	}
+	storage = strings.Trim(parts[0], `"`)
+	idx, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return 0, storage
+	}
+	return idx, storage
 }

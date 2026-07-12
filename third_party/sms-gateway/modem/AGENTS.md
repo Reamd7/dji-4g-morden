@@ -7,15 +7,15 @@
 为什么选 sms_gateway 而非 vohive/uicc-go?见 `docs/07`(标准符合度逐维度对比)。简述:
 - 比 uicc-go/at:**能发裸 AT**(uicc-go 只能 CSIM)、transport 可注入
 - 比 vohive/modem:AT 语法更对(ERROR 精确匹配、回显双保险、CMEE=1)、改造量更小(~25 行 vs 5 内部包剥离)
-- 已知短板:PDU 三缺陷(GSM-7 扩展表/长短信自动分段/16-bit ref),阶段 1 可接受,后续按 `docs/07` 路线 B 升级到 smscodec
+- PDU 层已于 2026-07-12 升级到 smscodec(路线 B,见下"§3"),原三缺陷已消除
 
 ## 文件
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
 | `modem.go` | 683 | `Modem` 结构体、并发模型、`readerLoop`、`SendAndWait`/`SendRaw`、`NewFromIO`(本副本新增)、ICMP ping |
-| `sms.go` | 490 | `Initialize`/`Send`/`ListStored`/`DeleteStored` + 设备查询(ICCID/IMEI/Carrier/PhoneNumber/SignalDBm) |
-| `pdu.go` | 574 | SMS PDU 编解码(`EncodeSubmit`/`DecodeDeliver`),手写 GSM-7/UCS-2/UDH/address/SCTS |
+| `sms.go` | ~490 | `Initialize`/`Send`(多段循环)/`ListStored`/`DeleteStored` + 设备查询(ICCID/IMEI/Carrier/PhoneNumber/SignalDBm) |
+| `pdu.go` | ~100 | **PDU facade**:保留 `DecodedSMS`/`ConcatInfo`/`DecodeDeliver` 类型与签名,委托 `third_party/smscodec` 编解码;`encodeSubmitPDUs` 内部 helper 供 `Send` 多段循环。手写编解码已全删 |
 
 ## 架构(并发模型)
 
@@ -50,19 +50,23 @@ SendAndWait (modem.go:113)
 
 ### 高层(sms.go)
 - `Initialize(ctx, pin)` —— 完整初始化:AT/ATE0/CMEE=1/CPIN?/CMGF=0/CNMI=2,1/CPMS="SM"。幂等。
-- `Send(ctx, recipient, body, udh)` —— 发短信(CMGS 两步握手,见下方坑)
+- `Send(ctx, recipient, body)` —— 发短信(smscodec 自动分段,多段循环 CMGS)
 - `ListStored(ctx)` —— `AT+CMGL=4` 列 SIM 已存短信
-- `DeleteStored(ctx, index)` —— `AT+CMGD=<index>`
+- `ReadStored(ctx, index)` —— `AT+CMGR=<index>` 单条读(B 类新增)
+- `DeleteStored(ctx, index)` / `DeleteAllStored(ctx)` —— `AT+CMGD` 单条 / `AT+CMGD=1,4` 全删(B 类新增)
+- `SMSC(ctx)` —— `AT+CSCA?` 查询短信中心(B 类新增)
+- `SetCharset(ctx, charset)` —— `AT+CSCS="<charset>"` 字符集(B 类新增)
+- `SetSMSCallback(cb)` —— 启用 +CMTI 自动收信管道(C 类新增):+CMTI→CMGR→decode→Reassembler→CMGD
 - `ICCID(ctx)` / `IMEI(ctx)` / `Carrier(ctx)` / `PhoneNumber(ctx)` / `SignalDBm(ctx)` —— 设备查询
-- `OnURC(h)` —— 注册 URC 处理器(如 +CMTI 新短信通知)
+- `OnURC(h)` —— 注册 URC 处理器(底层,SetSMSCallback 基于此)
 
 ### 底层(modem.go)
 - `SendAndWait(ctx, cmd, timeout)` —— 发任意裸 AT,等 OK/ERROR,返回响应行
 - `SendRaw(p)` —— 裸写字节(如 CMGS 的 PDU + Ctrl-Z)
 
 ### PDU(pdu.go)
-- `EncodeSubmit(recipient, body, udh)` —— 编码 SMS-SUBMIT PDU
-- `DecodeDeliver(hexPDU)` —— 解码 SMS-DELIVER(接收的短信)
+- `DecodeDeliver(hexPDU)` —— 解码 SMS-DELIVER(先剥 SCA 再委托 smscodec)
+- `encodeSubmitPDUs(recipient, body)` —— 内部 helper,smscodec 编码 + `00` SCA 前缀,供 Send 循环
 
 ## 已知坑(实施时踩过)
 
@@ -96,14 +100,20 @@ func readLine(r *bufio.Reader) (string, error) {
 
 测试代码遇到此情况可参考 `cmd/` 下的探针(已删,但思路:`tt.Write([]byte{0x1B})` + 等 500ms)。
 
-### 3. PDU 三缺陷(未修复,阶段 1 可接受)
+### 3. PDU 层:已升级到 smscodec(路线 B,2026-07-12)
 
-来自 `docs/07` §D:
-- **GSM-7 扩展表缺失**:`^{}[]~|\€` 全变 `?`(`pdu.go:4-5` 明确放弃)。收含这些字符的短信丢字。
-- **长短信不自动分段**:超长报错(`pdu.go:191`),靠调用方切。发送只支持 8-bit ref(`pdu.go:161`),无 16-bit。
-- **长短信不自动重组**:`DecodeDeliver` 返回 `ConcatInfo` 但不拼,调用方自己组装。
+原手写 `pdu.go` 的三个缺陷**已全部消除**(改用 `third_party/smscodec` + warthog618/sms):
+- ~~GSM-7 扩展表缺失~~ → ✅ 完整 TS 23.038 §6.2.1 扩展表(`^{}[]~|\€` 不再丢字,离线测试 `TestDecodeDeliver_GSM7Extension` 验证)
+- ~~长短信不自动分段~~ → ✅ `BuildSubmitTPDUs` 自动分段,`Send` 循环 CMGS
+- ~~长短信不自动重组~~ → ✅ `smscodec.Reassembler` 已就位(接入留阶段 2 +CMTI)
 
-**升级路径**(`docs/07` 路线 B):引入 `pkg/smscodec/`(vohive 的,只依赖 warthog618/sms),替换 EncodeSubmit/DecodeDeliver 调用点 + 加 Reassembler。
+**API 变更**:
+- `Send(ctx, recipient, body, udh SubmitUDH)` → `Send(ctx, recipient, body)`(自动分段,删手工 UDH)
+- `EncodeSubmit` / `SubmitUDH` 删除(被多段能力取代)
+- `DecodeDeliver(hexPDU)` 签名不变(facade 内部先剥 SCA 再委托 smscodec;`ConcatInfo` 保留 Seq→Part 映射)
+- 新增 `smscodec` 依赖:仅 `warthog618/sms v0.3.0`(MIT)
+
+升级实施见 `plans/upgrade-smscodec.md`。
 
 ## 不要在这里做的事
 

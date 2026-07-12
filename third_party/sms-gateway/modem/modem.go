@@ -24,6 +24,8 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"go.bug.st/serial"
+
+	"dji-modem-research/third_party/smscodec"
 )
 
 type Modem struct {
@@ -45,7 +47,21 @@ type Modem struct {
 	iccidMu       sync.Mutex
 	iccidCache    string
 	iccidCachedAt time.Time
+
+	// Reassembler accumulates incoming long-SMS segments until complete. Fed
+	// by the +CMTI auto-read handler (see sms.go handleIncomingSMS).
+	reassembler *smscodec.Reassembler
+
+	// smsCallback is invoked when a complete SMS (single-part or reassembled)
+	// arrives via the +CMTI auto-read pipeline. nil = auto-read disabled.
+	smsCbMu sync.Mutex
+	smsCb   SMSCallback
 }
+
+// SMSCallback is invoked when a complete SMS arrives via the +CMTI auto-read
+// pipeline (see SetSMSCallback). sender is the originator MSISDN, content is
+// the (possibly reassembled) message body, ts is the service-center timestamp.
+type SMSCallback func(sender, content string, ts time.Time)
 
 type URCHandler func(line string)
 
@@ -78,9 +94,10 @@ func Open(port string, baud int) (*Modem, error) {
 		return nil, err
 	}
 	m := &Modem{
-		port:    p,
-		pending: make(chan *call, 1),
-		closed:  make(chan struct{}),
+		port:        p,
+		pending:     make(chan *call, 1),
+		closed:      make(chan struct{}),
+		reassembler: smscodec.NewReassembler(),
 	}
 	go m.readerLoop()
 	return m, nil
@@ -93,14 +110,14 @@ func Open(port string, baud int) (*Modem, error) {
 // blocking Read would prevent shutdown.
 func NewFromIO(port io.ReadWriteCloser) *Modem {
 	m := &Modem{
-		port:    port,
-		pending: make(chan *call, 1),
-		closed:  make(chan struct{}),
+		port:        port,
+		pending:     make(chan *call, 1),
+		closed:      make(chan struct{}),
+		reassembler: smscodec.NewReassembler(),
 	}
 	go m.readerLoop()
 	return m
 }
-
 func (m *Modem) Close() error {
 	var err error
 	m.closeOnce.Do(func() {
@@ -660,24 +677,38 @@ func isTimeout(err error) bool {
 	return false
 }
 
-// readLine reads up to '\n' from r. Differs from bufio.Reader.ReadString in
-// that a partial-read timeout returns whatever is buffered without erroring.
+// readLine reads one logical line from r.
 //
-// Special case for the CMGS ">" prompt: that prompt is terminated by a space,
-// not '\n', so ReadString('\n') would leave it stuck in the buffer forever on
-// a USB CDC-AT endpoint (where bytes only arrive when the modem sends them).
-// When a partial read (no '\n' yet) yields exactly ">" after trimming, return
-// it as a complete line so the caller's `line == ">"` branch fires.
+// It returns a complete line once either:
+//   - a '\n'-terminated line is available (the normal AT response case), or
+//   - the buffered content (no '\n' yet) is exactly the CMGS ">" prompt.
+//
+// The ">" special case is necessary because the CMGS prompt is terminated by a
+// space, not '\n'. This implementation reads one byte at a time so it can
+// detect ">" immediately after it arrives, without depending on the transport
+// returning a timeout error. This makes it work both with short-timeout
+// polling (serial) and the long-lived blocking read (USB, direction F —
+// issue/001), where a Read blocks until data arrives and ReadString('\n')
+// would deadlock waiting for a '\n' that the ">" prompt never sends.
 func readLine(r *bufio.Reader) (string, error) {
-	line, err := r.ReadString('\n')
-	if err == nil {
-		return line, nil
+	var buf []byte
+	one := make([]byte, 1)
+	for {
+		n, err := r.Read(one)
+		if n > 0 {
+			buf = append(buf, one[:n]...)
+			// Complete line?
+			if one[0] == '\n' {
+				return string(buf), nil
+			}
+			// CMGS prompt? ">" arrives without a trailing '\n'. Detect it as
+			// soon as the trimmed buffer equals ">".
+			if strings.TrimSpace(string(buf)) == ">" {
+				return string(buf), nil
+			}
+		}
+		if err != nil {
+			return string(buf), err
+		}
 	}
-	// Partial read (timeout / no '\n'). If the buffered content is the CMGS
-	// prompt, surface it as a line; otherwise return as-is so callers can
-	// treat it as a nothing-to-do timeout.
-	if strings.TrimSpace(line) == ">" {
-		return line, nil
-	}
-	return line, err
 }

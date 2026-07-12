@@ -8,7 +8,7 @@
 gousb (libusb/WinUSB)
     ↓ USB bulk transfer
 ATTransport (本包)
-    ↓ io.ReadWriteCloser + 200ms 短轮询 Read 语义
+    ↓ io.ReadWriteCloser + 长阻塞读(Close 时才 cancel)语义
 modem.NewFromIO (third_party/sms-gateway/modem)
     ↓ AT 命令收发 + PDU 编解码
 短信收发 / 设备信息查询
@@ -27,17 +27,25 @@ modem.NewFromIO (third_party/sms-gateway/modem)
 
 ## 关键设计
 
-### Read 的 200ms 短超时轮询(核心,与串口 deadline 链不同)
+### Read 的长阻塞读(方向 F,修复 WinUSB cancel 崩溃)
 
-`Read` 每次 `context.WithTimeout(200ms)` 包 `in.ReadContext`:
-- **无数据时**:200ms 后返回 `context.DeadlineExceeded`
-- `context.DeadlineExceeded` **实现了 `Timeout() bool`**(返回 true)
-- modem.readerLoop 的 `isTimeout`(`modem.go:652`)用 `interface{ Timeout() bool }` 断言识别它 → 当 "nothing to do" → continue
-- 这样 readerLoop 每 200ms 唤醒一次,能周期性检查 `m.closed` channel 响应 Close
+`Read` 用一个**长生命期 context**(`readCtx`,`context.WithCancel(Background)` 无超时)调
+`in.ReadContext`,阻塞到有数据或 Close——**运行期 0 次 `libusb_cancel_transfer`**。
+只有 `Close` 调 `readCancel()` 才 cancel 一次。
 
-**为什么不走 deadline 链**:sms_gateway/modem 包根本**没有 deadline 链**(不像 uicc-go/at 的 `readDeadliner`)。超时由 readerLoop 的 200ms 短轮询控制。这是选 sms_gateway 而非 uicc-go 的副作用(见 `docs/07`)。
+**为什么不短轮询**:原设计 `ReadContext(ctx200ms)` 会让 gousb 每 200ms 调一次
+`libusb_cancel_transfer`(~5 次/秒),在 WinUSB 上偶发 segfault(发送时 read-cancel
+撞上 write transfer 并发)。详见 `issue/001-gousb-close-transfer-cancel-crash.md`。
+判别实验证实:10× 降频(2000ms)消除崩溃;方向 F 把发送期间 cancel 降到 0,根治。
 
-**gousb 超时返回值事实**:文档说返回 `TransferCancelled`,但 `cmd/attest` 实测返回 `context.DeadlineExceeded`。后者实现 `Timeout()`,所以链路通。
+**Close 配合**:`Close` 先 `readCancel()`(让在途 Read 返回)再释放 USB handles,
+避免"释放 USB 时有在途 transfer"的竞态。`context.Canceled` 实现 `Timeout()==true`,
+modem.readerLoop 的 `isTimeout` 识别后 continue,下一轮检查 `m.closed` 退出。
+
+**readLine 配套改造**(modem 包):原 `readLine` 靠"读超时返回错误"检测 CMGS `>` 提示符
+(`>` 不以 `\n` 结尾)。长阻塞读下 Read 不超时 → `ReadString('\n')` 永远等不到 `\n` →
+`>` 卡死。改为逐字节 `r.Read`,每字节检查 `\n`(完整行)或 buffer 已是 `>`(提示符),
+不再依赖超时。这让 readLine 同时对串口(短超时)和 USB(长阻塞)工作。
 
 ### endpointReader / endpointWriter 接口抽象(可测性)
 
@@ -47,7 +55,7 @@ type endpointReader interface { ReadContext(ctx context.Context, buf []byte) (in
 type endpointWriter interface { Write(buf []byte) (int, error) }
 ```
 - **生产**:gousb 的 `*InEndpoint`/`*OutEndpoint` 天然满足,编译期断言 `_ endpointReader = (*gousb.InEndpoint)(nil)`
-- **测试**:`scriptReader`/`scriptWriter` 适配 `testutil.ScriptPort`,让 Read 的超时逻辑完全离线测试
+- **测试**:`scriptReader`/`scriptWriter` 适配 `testutil.ScriptPort`,让 Read 的长阻塞逻辑完全离线测试
 
 ### Open 的资源管理
 
@@ -75,7 +83,7 @@ MI_02 AT 口:`epOut=0x03`、`epIn=0x84`。硬编码在 hardware test 的 `hwEpOu
 
 - ❌ 不要加 AT 命令逻辑(属于 modem 包)
 - ❌ 不要加 QMI 通道(阶段 2,会是新的 `internal/qmitransport/` 或类似)
-- ❌ 不要加 deadline 链(modem 包不需要,见上)
+- ❌ 不要恢复 200ms 短轮询 Read(会重新触发 WinUSB cancel 崩溃,见 `issue/001`)
 
 ## 下一步演进
 

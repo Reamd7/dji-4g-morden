@@ -13,6 +13,7 @@ package usbtransport
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,6 +109,45 @@ func TestHardwareSMSListStoredAndDecode(t *testing.T) {
 		}
 	}
 }
+// TestHardwareSMSCAndReadStored verifies the new B-class commands against real
+// hardware: AT+CSCA? (service center) and AT+CMGR=<index> (single-message read).
+// ReadStored is exercised by reading index 0 (or the first stored index from
+// ListStored) and decoding it. Read-only.
+func TestHardwareSMSCAndReadStored(t *testing.T) {
+	tt, m := openInitializedModem(t)
+	defer m.Close()
+	defer tt.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// SMSC query.
+	smsc, err := m.SMSC(ctx)
+	if err != nil {
+		t.Fatalf("SMSC: %v", err)
+	}
+	t.Logf("SMSC: %s", smsc)
+
+	// ReadStored: read the first stored message via AT+CMGR and decode it.
+	msgs, err := m.ListStored(ctx)
+	if err != nil {
+		t.Fatalf("ListStored: %v", err)
+	}
+	if len(msgs) == 0 {
+		t.Skip("no stored messages — send a test SMS first")
+	}
+	idx := msgs[0].Index
+	sm, err := m.ReadStored(ctx, idx)
+	if err != nil {
+		t.Fatalf("ReadStored(%d): %v", idx, err)
+	}
+	decoded, err := modem.DecodeDeliver(sm.PDU)
+	if err != nil {
+		t.Errorf("index %d PDU %q: DecodeDeliver: %v", idx, sm.PDU, err)
+	} else {
+		t.Logf("ReadStored[%d] from=%s body=%q", idx, decoded.Sender, decoded.Body)
+	}
+}
 
 // TestHardwareSMSSend sends a real SMS to the number in DJI_TEST_SMS_RECIPIENT.
 // Skipped unless that env var is set, since it costs money and notifies a real
@@ -128,8 +168,31 @@ func TestHardwareSMSSend(t *testing.T) {
 	defer cancel()
 
 	body := "dji-modem-research USB transport test"
-	if err := m.Send(ctx, recipient, body, modem.SubmitUDH{}); err != nil {
+	if err := m.Send(ctx, recipient, body); err != nil {
 		t.Fatalf("Send to %s: %v", recipient, err)
 	}
 	t.Logf("SMS sent to %s: %q", recipient, body)
+}
+// TestHardwareSMSSendMultiPart sends a long (>160 GSM-7 septet) SMS to verify
+// the smscodec auto-segmentation + Send's per-segment CMGS loop (route B's new
+// capability). The recipient should receive it reassembled into one message.
+func TestHardwareSMSSendMultiPart(t *testing.T) {
+	recipient := os.Getenv("DJI_TEST_SMS_RECIPIENT")
+	if recipient == "" {
+		t.Skip("DJI_TEST_SMS_RECIPIENT not set — skipping multipart send test")
+	}
+
+	tt, m := openInitializedModem(t)
+	defer m.Close()
+	defer tt.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// 200 ASCII chars > 160 GSM-7 septet limit → smscodec splits into ≥2 segments.
+	body := strings.Repeat("B", 200)
+	if err := m.Send(ctx, recipient, body); err != nil {
+		t.Fatalf("Send (multipart) to %s: %v", recipient, err)
+	}
+	t.Logf("multipart SMS sent to %s: %d chars (should arrive reassembled)", recipient, len(body))
 }

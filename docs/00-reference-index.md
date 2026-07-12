@@ -54,3 +54,8 @@ Windows 短信工具（`send_sms.js` / `read_sms.js`）+ Quectel 驱动安装包
 | `05-sms-gateway-modem-analysis.md` | sms_gateway/modem 包实现剖析（AT 通道 + PDU 编解码 + transport 改造点 + 复用评估） |
 | `06-vohive-modem-analysis.md` | vohive/modem Manager + smscodec 包实现剖析（AT 通道 + PDU + URC + 复用评估） |
 | `07-at-implementation-comparison.md` | 两个 AT 实现的电信标准符合度逐维度对比 + 选型建议 |
+| `08-ec25-at-commands-index.md` | Quectel EC25&EC21 AT Commands Manual V1.2 全册逐命令索引 + 三阶段相关性标注 + modem 包实现状态对照 |
+| `Quectel_EC25EC21_AT_Commands_Manual_V1.2.pdf` | 官方 AT 命令手册原件（2017-11-14, 231 页）。docs/08 是其索引 |
+| `09-ec20-at-commands-index.md` | Quectel EC20 AT Commands Manual V1.1 全册索引 + 与 EC25 V1.2 差异对照(EC20 是子集,仅多 airplanecontrol) |
+| `EC20.pdf` | EC20 官方 AT 命令手册原件(2015-07-14, 191 页)。docs/09 是其索引 |
+| `10-at-commands-alignment.md` | AT 命令全集对齐状态：133 条逐命令状态(✅/🔲/🔧/⬜) + 上游溯源(SG/VH 对照) + A-E 大类评分 + 待实现优先级分组。统一对齐追踪文档 |

@@ -20,9 +20,9 @@ import (
 	modem "dji-modem-research/third_party/sms-gateway/modem"
 )
 
-// isTimeoutErr reports whether err is a poll-deadline timeout (readPollInterval
-// elapsed with no data). gousb surfaces context.DeadlineExceeded, which
-// implements Timeout() bool == true.
+// isTimeoutErr reports whether err is a context-cancellation error. Since
+// direction F (long-lived read), Read returns context.Canceled on Close,
+// which implements Timeout() bool == true.
 func isTimeoutErr(err error) bool {
 	var t interface{ Timeout() bool }
 	if errors.As(err, &t) {
