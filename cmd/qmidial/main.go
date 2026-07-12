@@ -33,7 +33,6 @@ import (
 	"dji-modem-research/internal/qmidatapath"
 	"dji-modem-research/internal/qmitransport"
 	"dji-modem-research/third_party/quectel-qmi-go/manager"
-	"dji-modem-research/third_party/quectel-qmi-go/netcfg"
 	"dji-modem-research/third_party/quectel-qmi-go/qmi"
 )
 
@@ -111,7 +110,7 @@ func main() {
 		APN:        *apn,
 		EnableIPv4: true,
 		EnableIPv6: true,
-		Device:     manager.ModemDevice{NetInterface: tunName}, // triggers WDA allocation when non-empty
+		Device:     manager.ModemDevice{NetInterface: tunName},
 		Timeouts: manager.TimeoutConfig{
 			IndicationRegister: 15 * time.Second,
 			Init:               30 * time.Second,
@@ -210,49 +209,63 @@ func main() {
 				fmt.Println("      OK — DNS configured")
 			}
 		}
-		// Fix routing: TUN is point-to-point, needs direct route (not gateway)
-		fmt.Printf("      Adding direct default route via %s...\n", tunName)
-		if err := netcfg.AddDefaultRouteDirect(tunName, false); err != nil {
-			fmt.Printf("      warn: AddDefaultRouteDirect: %v\n", err)
-		} else {
-			fmt.Println("      OK — default route added (direct, no gateway)")
-		}
-
-		// Verify connectivity
-		time.Sleep(2 * time.Second) // let relay stabilize
-
-		// Debug: show routing table + interface metrics
-		fmt.Println("\n  === Routing table (IPv4) ===")
-		runCommand("route", "print", "0.0.0.0")
-		fmt.Println("  === Interface metrics ===")
-		runCommand("netsh", "interface", "ipv4", "show", "interfaces")
-
-		// Set qmi0 metric to 1 (lowest = highest priority) so traffic goes through TUN
-		fmt.Printf("  Setting %s metric=1...\n", tunName)
-		runCommand("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=1")
-
-		// Allow ICMP both directions through Windows Firewall
-		fmt.Println("  Adding Windows Firewall ICMP rules (out+in)...")
+		// Allow ICMP through Windows Firewall
+		fmt.Println("      Adding Windows Firewall ICMP rules...")
 		runCommand("netsh", "advfirewall", "firewall", "add", "rule",
 			"name=qmi-tun-icmp-out", "protocol=icmpv4:8,any", "dir=out", "action=allow")
 		runCommand("netsh", "advfirewall", "firewall", "add", "rule",
 			"name=qmi-tun-icmp-in", "protocol=icmpv4:0,any", "dir=in", "action=allow")
 
-		fmt.Println("  Testing ping baidu.com through TUN...")
-		runCommand("ping", platformPingArgs("baidu.com")...)
+		tunIP := ""
 		if s := mgr.Settings(); s != nil && len(s.IPv4Address) > 0 {
-			fmt.Printf("  Testing ping -S %s baidu.com...\n", s.IPv4Address)
-			runCommand("ping", platformPingArgsWithSource("baidu.com", s.IPv4Address.String())...)
+			tunIP = s.IPv4Address.String()
 		}
-		runCommand("nslookup", "baidu.com")
-		fmt.Println("  Testing TCP (curl http://www.baidu.com)...")
-		runCommand("curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}s", "http://www.baidu.com")
 
-		// Tests done — auto-exit (cleanup follows)
-		// Print relay stats
-		txPkt, txByt, rxPkt, rxByt := bridge.Stats()
-		fmt.Printf("\n  Relay stats: TX %d pkts/%d bytes, RX %d pkts/%d bytes\n",
-			txPkt, txByt, rxPkt, rxByt)
+		time.Sleep(2 * time.Second) // let relay stabilize
+
+		// ════════════════════════════════════════════════════════════════
+		// Phase 1: High-metric route — source-bound (-S) goes through 4G,
+		//           default traffic stays on main network (lower metric wins)
+		// ════════════════════════════════════════════════════════════════
+		fmt.Println("\n════ Phase 1: Source-bound (qmi0 metric=100, main=25) ══")
+		fmt.Printf("  Setting %s metric=100 (main network wins by default)...\n", tunName)
+		runCommand("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=100")
+
+		fmt.Println("  [1a] Main network — ping baidu.com:")
+		runCommand("ping", platformPingArgs("baidu.com")...)
+		if tunIP != "" {
+			fmt.Printf("  [1b] 4G TUN — ping -S %s baidu.com:\n", tunIP)
+			runCommand("ping", platformPingArgsWithSource("baidu.com", tunIP)...)
+			fmt.Println("  [1c] 4G TUN — curl --interface:")
+			runCommand("curl", "-s", "-o", "NUL", "-w", "%{http_code} %{time_total}s",
+				"--interface", tunIP, "http://www.baidu.com")
+			fmt.Println()
+		}
+
+		txPkt1, _, rxPkt1, _ := bridge.Stats()
+
+		// ════════════════════════════════════════════════════════════════
+		// Phase 2: Global TUN — metric=1 (ALL traffic → 4G)
+		// ════════════════════════════════════════════════════════════════
+		fmt.Println("\n════ Phase 2: Global TUN (metric=1, all → 4G) ══════════")
+		fmt.Printf("  Setting %s metric=1...\n", tunName)
+		runCommand("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=1")
+
+		fmt.Println("  [2a] ping baidu.com (all through 4G):")
+		runCommand("ping", platformPingArgs("baidu.com")...)
+		fmt.Println("  [2b] curl http://www.baidu.com:")
+		runCommand("curl", "-s", "-o", "NUL", "-w", "%{http_code} %{time_total}s", "http://www.baidu.com")
+		fmt.Println()
+		fmt.Println("  [2c] nslookup baidu.com:")
+		runCommand("nslookup", "baidu.com")
+
+		// Reset metric before cleanup
+		runCommand("netsh", "interface", "ipv4", "set", "interface", tunName, "metric=auto")
+
+		txPkt2, txByt2, rxPkt2, rxByt2 := bridge.Stats()
+		fmt.Printf("\n  Relay stats: TX %d pkts/%d B, RX %d pkts/%d B\n", txPkt2, txByt2, rxPkt2, rxByt2)
+		fmt.Printf("  Phase 1: %d TX + %d RX (source-bound)\n", txPkt1, rxPkt1)
+		fmt.Printf("  Phase 2: %d TX + %d RX (global TUN)\n", txPkt2-txPkt1, rxPkt2-rxPkt1)
 
 		fmt.Println("\n  Tests complete. Disconnecting...")
 	} else {
