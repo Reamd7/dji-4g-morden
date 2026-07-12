@@ -21,3 +21,7 @@
 /references/linux-driver/
 cmd/qmidial/qmidial_out.txt
 cmd/qmidial/qmidial_done.txt
+
+
+# Environment file with hardware test secrets (phone numbers, etc.)
+.env
