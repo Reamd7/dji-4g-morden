@@ -78,12 +78,12 @@ cmd/qmidial -tun: 端到端上网 + DNS 自建
 
 ## 四、完成标志
 
-- [ ] AGENTS.md 实测记录 + 目录结构 + 依赖更新
-- [ ] internal/qmidatapath/AGENTS.md 新建
-- [ ] internal/qmitransport/AGENTS.md 补 OpenBulkEndpoints
-- [ ] docs/01 §8.2 风险解除
-- [ ] git commit(pre-commit race 通过)
-- [ ] **阶段 3 全部完成:纯用户态 USB → 上网链路打通**
+- [x] AGENTS.md 实测记录 + 目录结构 + 依赖更新
+- [x] internal/qmidatapath/AGENTS.md 新建
+- [x] internal/qmitransport/AGENTS.md 补 OpenBulkEndpoints
+- [x] docs/01 §8.2 风险解除 + §六阶段 3 标完成
+- [x] git commit(pre-commit race 通过)
+- [x] **阶段 3 全部完成:纯用户态 USB → 上网链路打通**
 
 ---
 

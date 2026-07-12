@@ -81,6 +81,21 @@ func (t *QMITransport) Close() error                            // ioMu → clos
 func (t *QMITransport) SetReadDeadline(t time.Time) error       // 存 deadline 给 Read timer
 ```
 
+### 阶段 3:OpenBulkEndpoints(数据面)
+
+```go
+func (t *QMITransport) OpenBulkEndpoints() (bulkIn *gousb.InEndpoint, bulkOut *gousb.OutEndpoint, err error)
+```
+
+打开 MI_04 的 bulk IN (EP 0x88) 和 bulk OUT (EP 0x05),用于 raw IP 数据传输。
+
+- 与 QMI 控制面(EP0 + interrupt 0x89)**共享同一 MI_04 claim**,但使用不同 endpoint,**无竞争**
+- bulk 操作**不经 ioMu**(ioMu 只保护 EP0 control transfer)
+- 加锁 `ioMu` 防止与 Close 竞争(检查 closed 标志)
+- 返回原始 `*gousb.InEndpoint` / `*gousb.OutEndpoint`
+- 常量:`DefaultBulkInEP=0x88`, `DefaultBulkOutEP=0x05`
+- **Close 时序**:`tun.Close()` → `bridge.Stop()` → `QMITransport.Close()`(relay 必须先退出)
+
 ## 可测性
 
 `controlDevice` 和 `interruptReader` 接口抽象了 gousb 的 `*Device.Control` 和

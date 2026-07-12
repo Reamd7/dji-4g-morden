@@ -84,6 +84,16 @@
 - manager 全包复制(子计划 07):`NewWithClient` 利用 `openClientAndAllocateServicesHook` 注入预构造 client,绕过 Linux 设备发现。新增依赖 logrus/zap
 - **阶段 2 核心目标达成**
 
+**TUN 虚拟网卡 + 实际上网完成(2026-07-12)**:纯用户态 USB → QMI → TUN relay → 真实上网。零内核驱动,Windows 上全程跑通。ICMP/TCP/UDP 三协议双向通过 4G。
+- **bulk EP 数据探针**(`cmd/bulkprobe/`):确认 WDA SetDataFormat(raw-IP)后 bulk IN EP 0x88 承载裸 IP 包(IPv4 `0x45` + IPv6 `0x60`)。ZLP 确认:28B 包通,512B 包不通 → `zlp=true`
+- **relay 实现**(`internal/qmidatapath/`):Bridge 双向 goroutine(TUN.Read→bulkOut.Write / bulkIn.ReadContext→TUN.Write),raw-IP 直传无头处理,ZLP 参数化(探针驱动),offset=4(macOS headroom)。88.7% 覆盖率,13 mock 测试 + 2 硬件测试
+- **OpenBulkEndpoints**(`internal/qmitransport/bulkendpoints.go`):在同一 MI_04 claim 上打开 bulk IN 0x88 / bulk OUT 0x05,与 QMI 控制面(EP0+intr)不同 endpoint 无竞争
+- **端到端集成**(`cmd/qmidial -dial -tun`):TUN 创建 → manager(NetInterface 触发 WDA)→ Connect(配 IP/路由)→ relay 启动 → DNS 自建(netcfg.UpdateDNS Win/macOS 不可用 → netsh/networksetup/resolvectl)
+- **实测结果**:curl baidu.com HTTP 200(107ms)、nslookup 解析成功、ping baidu.com 4/4(68ms)。两种模式:源地址绑定(metric=100,主网络共存)+ 全局 TUN(metric=1,全走 4G)
+- **wintun.dll 修复**:gousb cgo 环境下 wintun-go 的 `LOAD_LIBRARY_SEARCH_APPLICATION_DIR` 解析失败 → `wintun_preload_windows.go` 全路径预加载。admin UAC 无 mise PATH → libusb-1.0.dll 也放 exe 同目录
+- **Linux 驱动参考**:`references/linux-driver/q_drivers/qmi_wwan/qmi_wwan_q.c` 确认 EC25 默认 `qmap_mode=0`(raw-IP)、`FLAG_SEND_ZLP`、DTR 在 bind() 设置
+- **三阶段全部完成**:纯用户态 USB → AT+短信 → QMI 拨号 → TUN 上网,零内核驱动
+
 ### 目录结构
 
 - `docs/` —— 调研报告(中文 markdown)
@@ -288,53 +298,61 @@ dji-modem-research/
 ├── go.mod           # module dji-modem-research
 ├── main.go          # hello world
 ├── internal/
-│   ├── usbdesc/     # USB 描述符格式化(纯逻辑,从 usbprobe 抽出,100% 覆盖)
-│   ├── testutil/    # ScriptPort mock io.ReadWriteCloser(供 transport 测试)
-│   ├── usbtransport/# ATTransport:USB bulk endpoint → io.ReadWriteCloser
-│   │   ├── usbtransport.go             # Open/Read(长阻塞读,方向F)/Write/Close
-│   │   ├── usbtransport_test.go        # mock 单测(ScriptPort + modem NewFromIO 集成)
-│   │   ├── usbtransport_hardware_test.go # AT 通路硬件集成测试(build tag: hardware)
-│   │   └── sms_hardware_test.go        # 短信收发硬件集成测试(build tag: hardware)
-│   └── qmitransport/ # QMITransport:USB model B EP0 控制封装 → qmi.Transport
-│       ├── qmitransport.go             # Open/DTR/interrupt goroutine/Read(GET)/Write(SEND)/Close(ioMu)
-│       ├── qmitransport_test.go        # 11 个离线 mock 测试(-race,~93% 适配层覆盖率)
-│       ├── qmitransport_hardware_test.go # transport 级硬件测试(Open/SYNC/并发 Close)
-│       ├── manager_hardware_test.go    # manager 级硬件测试(StartCore/拨号/双栈/并发 Close)
-│       └── AGENTS.md                   # 记忆点:模型 B + DTR + ioMu + issue/001 防护
+│   ├── usbdesc/     # USB 描述符格式化(纯逻辑,100% 覆盖)
+│   ├── testutil/    # ScriptPort mock io.ReadWriteCloser
+│   ├── usbtransport/# ATTransport:USB bulk → io.ReadWriteCloser
+│   │   ├── usbtransport.go             # Open/Read/Write/Close(方向F)
+│   │   ├── usbtransport_test.go        # mock 单测
+│   │   ├── usbtransport_hardware_test.go # AT 通路硬件测试
+│   │   └── sms_hardware_test.go        # 短信收发硬件测试
+│   ├── qmitransport/ # QMITransport:USB model B EP0 → qmi.Transport
+│   │   ├── qmitransport.go             # Open/DTR/interrupt/Read(GET)/Write(SEND)/Close(ioMu)
+│   │   ├── bulkendpoints.go            # OpenBulkEndpoints(EP 0x88/0x05,阶段 3 数据面)
+│   │   ├── qmitransport_test.go        # 11 mock + bulkendpoints 测试
+│   │   ├── qmitransport_hardware_test.go # transport 硬件测试
+│   │   ├── manager_hardware_test.go    # manager 硬件测试
+│   │   └── AGENTS.md                   # 记忆点:模型 B + DTR + ioMu + bulkendpoints
+│   └── qmidatapath/ # 阶段 3:TUN ↔ bulk EP 双向 raw IP relay
+│       ├── relay.go                    # Bridge + tunToModem + modemToTun + ZLP + Stats
+│       ├── relay_test.go              # 13 mock 测试(-race,88.7% 覆盖率)
+│       ├── relay_hardware_test.go     # 硬件测试(build tag: hardware)
+│       └── AGENTS.md                   # 记忆点:relay 设计 + Close 时序 + ZLP
 ├── third_party/
-│   ├── sms-gateway/ # 从 sms_gateway 复制的 AT 协议层"壳"(AGPL-3.0)
-│   │   └── modem/   # SG 壳:readerLoop/SendAndWait + AT 命令全集(Phase A-E)
-│   ├── smscodec/    # 从 vohive 复制的 PDU 编解码(warthog618/sms MIT + PolyForm NC)
-│   └── quectel-qmi-go/  # 从 vohive 复制的 QMI 协议栈 + manager(upstream 无 license,风险见 LICENSE)
-│       ├── qmi/                 # 协议栈核心:QMUX 分帧 + WDS/WDA/DMS/NAS/UIM/WMS/IMS/VOICE
-│       │   ├── transport_export.go # NewClientFromTransport 注入点(绕过 /dev/cdc-wdm0)
-│       │   └── *.go             # 各 service wrapper + 测试
-│       ├── manager/             # 全功能连接管理器(状态机/重连/拨号/netcfg,~13K 行)
-│       │   ├── manager.go       # 核心:Start/Connect/Stop + service 编排 + 重连
-│       │   ├── usb_entry.go     # NewWithClient:USB 注入点(SettingsV6/HandleV4/V6 getter)
-│       │   └── *.go             # callbacks/snapshot/service_recovery/smsc/uim/...
-│       ├── device/              # Linux sysfs 设备发现(USB 路径不用,hook 绕过)
-│       └── netcfg/              # 三平台网络配置(阶段 3 用)
+│   ├── sms-gateway/ # AT 协议层"壳"(AGPL-3.0)
+│   ├── smscodec/    # PDU 编解码(warthog618/sms MIT + PolyForm NC)
+│   └── quectel-qmi-go/  # QMI 协议栈 + manager
+│       ├── qmi/                 # 协议栈核心:QMUX + WDS/WDA/DMS/NAS/UIM/WMS
+│       ├── manager/             # 全功能连接管理器(~13K 行)
+│       ├── device/              # Linux sysfs 设备发现(USB 路径不用)
+│       └── netcfg/              # 三平台网络配置(UpdateDNS Win/macOS 不可用)
 ├── cmd/
-│   ├── usbprobe/    # USB 接口/endpoint 枚举探针(硬件,go run)
-│   ├── attest/      # MI_02 AT 通路验证(硬件,go run)
-│   ├── qmiprobe/    # QMI 传输模型探针(Phase 0,硬件,go run)
-│   └── qmidial/     # QMI 拨号工具(manager Start+Connect,-dial 激活 PDP,硬件)
+│   ├── usbprobe/    # USB endpoint 枚举探针
+│   ├── attest/      # MI_02 AT 通路验证
+│   ├── qmiprobe/    # QMI 传输模型探针(Phase 0)
+│   ├── qmidial/     # QMI 拨号 + TUN relay(-dial -tun 端到端上网)
+│   │   ├── main.go                  # -tun 标志:TUN + relay + DNS + ping/curl 测试
+│   │   ├── dns.go                    # 三平台 DNS 自建(netsh/networksetup/resolvectl)
+│   │   ├── wintun_preload_windows.go # wintun.dll 全路径预加载
+│   │   └── run_tun.bat               # admin UAC 提升运行
+│   └── bulkprobe/   # 阶段 3 门控探针(WDA + raw-IP + ZLP 确认)
 ├── issue/
-│   └── 001-gousb-close-transfer-cancel-crash.md  # WinUSB cancel 崩溃(方向F 根因)
+│   └── 001-gousb-close-transfer-cancel-crash.md
 ├── plans/
-│   ├── stage2-qmi-dialup.md  # 阶段 2 总览
-│   ├── stage2/               # 阶段 2 子计划 00-08
-│   └── archive/              # 已完成的计划(gousb/usb-transport/upgrade-smscodec/at-commands-roadmap)
-├── references/     # 外部参考资料(osmocom/sixfab,linux-driver gitignored)
+│   ├── stage2-qmi-dialup.md   # 阶段 2 总览
+│   ├── stage2/                # 阶段 2 子计划 00-08
+│   ├── stage3-tun-internet.md # 阶段 3 总览
+│   ├── stage3/                # 阶段 3 子计划 00-04
+│   └── archive/
+├── references/     # osmocom/sixfab/linux-driver/wintun-0.14.1.zip
 └── docs/           # 研究文档(01-03 方案/硬件/源码,04-10 AT 命令)
 ```
 
 - `go.mod` 模块名:`dji-modem-research`
-- 依赖:`github.com/google/gousb`(USB)、`github.com/rs/zerolog` + `go.bug.st/serial`(modem)、`github.com/warthog618/sms`(smscodec)、`github.com/sirupsen/logrus` + `go.uber.org/zap`(manager)
+- 依赖:`github.com/google/gousb`(USB)、`github.com/rs/zerolog` + `go.bug.st/serial`(modem)、`github.com/warthog618/sms`(smscodec)、`github.com/sirupsen/logrus` + `go.uber.org/zap`(manager)、`golang.zx2c4.com/wireguard/tun`(TUN 虚拟网卡,阶段 3)
 - 运行 AT 测试:`mise exec -- go run ./cmd/attest/`
 - 运行 QMI 拨号(只读):`mise exec -- go run ./cmd/qmidial`
 - 运行 QMI 拨号(激活 PDP):`mise exec -- go run ./cmd/qmidial -dial`
+- 运行 TUN 上网(需 admin + wintun.dll):`mise exec -- go build -o qmidial.exe ./cmd/qmidial && qmidial.exe -dial -tun`
 - 跑 mock 单测:`make test-race`
 - 跑硬件集成测试(需设备 + WinUSB):`make test-hardware`
 
@@ -343,5 +361,4 @@ dji-modem-research/
 两个 third_party 包都从上级 `source/` **复制**(非 go.mod replace),理由:可移植(无绝对路径依赖)、可改(改副本不影响上游)、依赖最小。选型见 `docs/07`。
 
 - **`sms-gateway/modem/`**(AGPL-3.0):AT 协议"壳"。核心改动:`port serial.Port` → `io.ReadWriteCloser` + `NewFromIO`(transport 注入);`readLine` USB 适配(`>` 提示符 + 逐字节读,方向F);`pdu.go` facade 化(委托 smscodec);补 11 条 AT 命令(network/sim/config 新文件);`SetSMSCallback` +CMTI 实时收信管道。保留 ICMP ping / zerolog / Open 串口路径。
-- **`smscodec/`**(vohive PolyForm NC + warthog618 MIT):PDU 编解码"芯"。**verbatim 一行不改**,委托 warthog618/sms 完整实现 TS 23.040(GSM-7 扩展表/长短信分段/重组),加国产模组容错(pdu_trim.go)。零 vohive 内部包依赖(复制前提)。
-- **`quectel-qmi-go/`**(license 待确认):QMI 协议栈 + manager。复制 `qmi/`(协议栈)+ `manager/`(全功能连接管理器,~13K 行)+ `device/`(Linux 设备发现)+ `netcfg/`(三平台网络配置)。`transport_export.go` 导出 `NewClientFromTransport` 注入 USB transport;`usb_entry.go` 导出 `NewWithClient` 注入预构造 client(hook 绕过 /dev/cdc-wdm0 + Linux sysfs)。阶段 2 拨号验证通过(IPv4+IPv6 双栈)。
+- **`quectel-qmi-go/`**(license 待确认):QMI 协议栈 + manager。复制 `qmi/`(协议栈)+ `manager/`(全功能连接管理器,~13K 行)+ `device/`(Linux 设备发现)+ `netcfg/`(三平台网络配置)。`transport_export.go` 导出 `NewClientFromTransport` 注入 USB transport;`usb_entry.go` 导出 `NewWithClient` 注入预构造 client(hook 绕过 /dev/cdc-wdm0 + Linux sysfs)。阶段 2 拨号验证通过(IPv4+IPv6 双栈),阶段 3 TUN relay 端到端上网验证通过(curl+DNS+ping)。

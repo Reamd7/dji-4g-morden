@@ -281,17 +281,20 @@ Wintun DLL 用于创建虚拟网卡。不需要安装，随程序分发。
 
 预计代码量：~150 行新代码 + ~5000 行现成协议代码复用。
 
-### 阶段 3：TUN 虚拟网卡 + 上网（最高难度）
+### 阶段 3：TUN 虚拟网卡 + 上网（最高难度）✅ 已完成(2026-07-12)
 
 目标：把 QMI 数据通道的 IP 包注入系统网络栈，实现真实上网。
 
-1. 用 wireguard/tun 库创建虚拟网卡（~10 行）
-2. 把 QMI WDS 拿到的 IP 配置到 TUN 上（用 netcfg 的 SetIPAddress）
-3. 从 QMI bulk IN endpoint 读 IP 包 → 写入 TUN（~100 行）
-4. 从 TUN 读 IP 包 → 写入 QMI bulk OUT endpoint（~100 行）
-5. 处理 MTU、路由、DNS
+实测结果:curl baidu.com HTTP 200(107ms)、nslookup 解析成功、ping baidu.com 4/4(68ms)。
+ICMP/TCP/UDP 三协议双向通过 4G。零内核驱动,Windows 全程跑通。
 
-预计代码量：~250 行新代码。
+1. ✅ wireguard/tun 创建 TUN(qmi0)
+2. ✅ manager.configureNetwork 配 IP/路由/MTU(netcfg)
+3. ✅ bulk IN EP 0x88 → TUN(qmidatapath.relay modemToTun)
+4. ✅ TUN → bulk OUT EP 0x05(qmidatapath.relay tunToModem + ZLP)
+5. ✅ DNS 自建(netcfg.UpdateDNS Win/macOS 不可用 → netsh/networksetup/resolvectl)
+
+新增代码:~300 行(relay ~230 + bulkendpoints ~30 + dns ~50)。
 
 ### 总计
 
@@ -329,13 +332,10 @@ Wintun DLL 用于创建虚拟网卡。不需要安装，随程序分发。
 - **Iface 4(QMI 数据通道)**:EP 0x05 OUT bulk / EP 0x88 IN bulk / EP 0x89 IN intr
 
 完整 5 接口布局见 AGENTS.md「实测验证结果」。规律:OUT 端点递增 0x01~0x05,IN 端点递增 0x81~0x89。
+### 8.2 QMI 数据格式 ✅ 已解除(2026-07-12)
 
-AT 通路已端到端验证(`cmd/attest/main.go`):通过 gousb claim Iface 2 → EP 0x03 发 `AT\r\n` → EP 0x84 收到回显 + `\r\nOK\r\n`。gousb → libusb → WinUSB → 模块链路正常。
-
-### 8.2 QMI 数据格式
-
-QMI 数据通道传输的可能是 raw-IP（直接是 IP 包）或 QMAP 封装。WDA service 有 SetDataFormat 命令，需要正确配置。如果模块默认是 QMAP 模式但 transport 没处理，收到的数据包格式会不对。
-
+实测确认:WDA SetDataFormat(LinkProtocolIP)后,bulk EP 承载 **raw-IP**(裸 IP 包,无 QMAP 头)。
+Linux `qmi_wwan_q.c` 确认 EC25 默认 `qmap_mode=0`(raw-IP)。ZLP 确认:512 倍数包需追加 ZLP。
 ### 8.3 Windows 上的 USB 接口争用
 
 如果 Iface 2 被 Quectel 驱动（qcser.sys）占用了，libusb 打不开它。需要先在设备管理器里卸载 Quectel 驱动或用 Zadig 替换成 WinUSB。这意味着方案 A 和方案 B 不能同时用（同一个接口不能同时被厂商驱动和 WinUSB 占用）。
