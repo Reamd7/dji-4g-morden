@@ -126,8 +126,8 @@ modem 可能只在有上行流量时才发下行。手动构造 ICMP echo reques
 
 ```go
 // 构造最小 ICMP echo request(IP 头 20 + ICMP 8 + 可选 payload)
-// src = 拨号拿的 IP(10.147.0.1),dst = 8.8.8.8 或网关
-icmpPkt := buildICMPEcho(srcIP, "8.8.8.8")
+// src = 拨号拿的 IP(10.147.0.1),dst = 114.114.114.114 或网关
+icmpPkt := buildICMPEcho(srcIP, "114.114.114.114")
 bulkOut.Write(icmpPkt)
 // 然后从 bulkIn 读,看是否收到 ICMP echo reply 或其他响应
 ```
@@ -140,7 +140,7 @@ bulkOut.Write(icmpPkt)
 构造恰好 512 字节的 IP 包(padding ICMP payload 到对齐):
 
 ```go
-pkt512 := buildICMPEchoPadded(srcIP, "8.8.8.8", 512)  // 恰好 512 字节
+pkt512 := buildICMPEchoPadded(srcIP, "114.114.114.114", 512)  // 恰好 512 字节
 bulkOut.Write(pkt512)
 // 不追加 ZLP,读 bulk IN
 // 如果卡住 → modem 期望 ZLP(len%512==0 时需追加 0 字节 Write)

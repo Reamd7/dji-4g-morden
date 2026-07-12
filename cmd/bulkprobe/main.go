@@ -158,7 +158,7 @@ func main() {
 
 	if count == 0 {
 		fmt.Println("\n[Phase D] Sending ICMP echo via bulk OUT EP 0x05...")
-		dstIP := "8.8.8.8"
+		dstIP := "114.114.114.114"
 		icmpPkt := buildICMPEcho(srcIP.String(), dstIP, 0)
 		fmt.Printf("  Sending %d-byte ICMP echo to %s\n", len(icmpPkt), dstIP)
 
@@ -190,7 +190,7 @@ func main() {
 	// ── Phase D2: ZLP test (R5 verification) ─────────────────────────────
 
 	fmt.Println("\n[Phase D2] ZLP test — sending exactly 512-byte packet...")
-	dstIP := "8.8.8.8"
+	dstIP := "114.114.114.114"
 	// IP header = 20, ICMP header = 8, payload = 512 - 20 - 8 = 484
 	needed := 512 - 20 - 8
 	pkt512 := buildICMPEcho(srcIP.String(), dstIP, needed)

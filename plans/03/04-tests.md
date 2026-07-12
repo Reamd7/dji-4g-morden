@@ -74,7 +74,7 @@ type fakeTUN struct {
 | 测试 | 内容 |
 |---|---|
 | `TestHardwareBulkEndpoints` | OpenBulkEndpoints 返回非 nil(EP 0x88/0x05 可打开) |
-| `TestHardwareRelayEndToEnd` | 拨号 + TUN + relay + ping 8.8.8.8 走 4G(核心端到端) |
+| `TestHardwareRelayEndToEnd` | 拨号 + TUN + relay + ping 114.114.114.114 走 4G(核心端到端) |
 | `TestHardwareRelayZLPReal` | 真实 512 字节包是否需 ZLP(验证 R5) |
 
 ### 3.2 端到端测试流程
@@ -85,13 +85,13 @@ func TestHardwareRelayEndToEnd(t *testing.T) {
     // 2. 创建 TUN
     // 3. OpenBulkEndpoints + Bridge.Start
     // 4. 等 IP/路由配好
-    // 5. exec.Command("ping", "-n", "4", "8.8.8.8") 或 curl
+    // 5. exec.Command("ping", "-n", "4", "114.114.114.114") 或 curl
     // 6. 断言 ping 成功(loss < 100%)
     // 7. bridge.Stop + cleanup
 }
 ```
 
-成功标准:`ping 8.8.8.8` 通过 4G(loss < 100%),证明 relay 双向工作。
+成功标准:`ping 114.114.114.114` 通过 4G(loss < 100%),证明 relay 双向工作。
 
 跑:
 ```bash
@@ -114,7 +114,7 @@ DJI_TEST_APN=3gnet mise exec -- go test -tags=hardware -v -run TestHardwareRelay
 ## 五、完成标志
 
 - [ ] `relay_test.go` 9 个 mock 测试,`-race` 通过
-- [ ] `relay_hardware_test.go` 硬件测试真实跑通(ping 8.8.8.8 走 4G)
+- [ ] `relay_hardware_test.go` 硬件测试真实跑通(ping 114.114.114.114 走 4G)
 - [ ] coverage relay 适配层 ≥ 80%
 
 ---

@@ -95,7 +95,7 @@ func (f *fakeTUN) Close() error { return nil }
 | 测试 | 内容 |
 |---|---|
 | `TestHardwareBulkEndpoints` | OpenBulkEndpoints 返回非 nil(EP 0x88/0x05 可打开) |
-| `TestHardwareRelayEndToEnd` | 拨号 + TUN + relay + ping 8.8.8.8 走 4G(核心端到端) |
+| `TestHardwareRelayEndToEnd` | 拨号 + TUN + relay + ping 114.114.114.114 走 4G(核心端到端) |
 | `TestHardwareRelayDNS` | DNS 解析:nslookup baidu.com 通过(验证 DNS 自建) |
 | `TestHardwareRelayZLPReal` | 真实 512 字节包是否需 ZLP(验证 R5) |
 
@@ -108,7 +108,7 @@ func TestHardwareRelayEndToEnd(t *testing.T) {
     // 3. OpenBulkEndpoints + Bridge.Start
     // 4. 等 IP/路由配好(configureNetwork)
     // 5. 配 DNS(自建)
-    // 6. exec.Command("ping", "-n", "4", "8.8.8.8")  // Windows: -n, Linux/macOS: -c
+    // 6. exec.Command("ping", "-n", "4", "114.114.114.114")  // Windows: -n, Linux/macOS: -c
     // 7. 断言 ping 成功(loss < 100%)
     // 8. exec.Command("nslookup", "baidu.com")       // DNS 验证
     // 9. 断言 DNS 解析成功
@@ -116,7 +116,7 @@ func TestHardwareRelayEndToEnd(t *testing.T) {
 }
 ```
 
-成功标准:`ping 8.8.8.8` 通过 4G(loss < 100%) + `nslookup baidu.com` 解析成功。
+成功标准:`ping 114.114.114.114` 通过 4G(loss < 100%) + `nslookup baidu.com` 解析成功。
 
 跑:
 ```bash
@@ -139,7 +139,7 @@ DJI_TEST_APN=3gnet mise exec -- go test -tags=hardware -v -run TestHardwareRelay
 ## 五、完成标志
 
 - [ ] `relay_test.go` 9 个 mock 测试,`-race` 通过
-- [ ] `relay_hardware_test.go` 硬件测试真实跑通(ping 8.8.8.8 + DNS 走 4G)
+- [ ] `relay_hardware_test.go` 硬件测试真实跑通(ping 114.114.114.114 + DNS 走 4G)
 - [ ] coverage relay 适配层 ≥ 80%
 
 ---

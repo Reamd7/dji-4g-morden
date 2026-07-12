@@ -19,7 +19,7 @@
 - **数据格式确认**(子计划 01):bulk EP 承载 raw-IP / QMAP(实测结果);WDA SetDataFormat 在 QDC507 上成功/失败
 - **relay 实现**(子计划 02):`internal/qmidatapath/`,双向 goroutine,raw-IP 直传 / QMAP 剥头
 - **ZLP 结论**(子计划 01 D2):512 倍数包是否需手动 ZLP
-- **上网验证**(子计划 04):ping 8.8.8.8 走 4G 成功(实测延迟/丢包)
+- **上网验证**(子计划 04):ping 114.114.114.114 走 4G 成功(实测延迟/丢包)
 - **三阶段全部完成**:纯用户态 USB → AT+短信 → QMI 拨号 → TUN 上网,零内核驱动
 
 目录结构段补:
@@ -60,7 +60,7 @@ internal/qmidatapath/: Bridge + 双向 relay (TUN↔bulk)
 cmd/bulkprobe/: 阶段 3 门控探针 (WDA + raw-IP 确认)
 cmd/qmidial -tun: 端到端上网
 
-实测:数据格式=raw-IP,WDA=OK,relay 双向,ping 8.8.8.8 走 4G 成功
+实测:数据格式=raw-IP,WDA=OK,relay 双向,ping 114.114.114.114 走 4G 成功
 零内核驱动,三阶段全部完成。
 ```
 

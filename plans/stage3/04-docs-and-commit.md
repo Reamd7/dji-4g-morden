@@ -21,7 +21,7 @@
 - **ZLP 结论**(子计划 00 D2):512 倍数包是否需手动 ZLP
 - **relay 实现**(子计划 01):`internal/qmidatapath/`,双向 goroutine,raw-IP 直传 / QMAP 剥头
 - **DNS 自建**(子计划 02):netcfg.UpdateDNS 在 Windows/macOS 不可用,自建 netsh/networksetup/resolvectl
-- **上网验证**(子计划 03):ping 8.8.8.8 + nslookup 走 4G 成功
+- **上网验证**(子计划 03):ping 114.114.114.114 + nslookup 走 4G 成功
 - **三阶段全部完成**:纯用户态 USB → AT+短信 → QMI 拨号 → TUN 上网,零内核驱动
 
 目录结构段补:
