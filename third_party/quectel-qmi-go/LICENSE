@@ -18,15 +18,17 @@ the author (iniwex5).
   service wrappers: WDS/WDA/DMS/NAS/UIM/WMS/IMS/VOICE)
 - `pkg/netcfg/` → `netcfg/` (8 Go files) — platform network configuration
   (Linux/macOS/Windows, used in stage 3)
-
-## What was NOT copied
-
-- `pkg/manager/` — couples to Linux device discovery (subplan 07 decision)
-- `pkg/device/` — Linux sysfs device discovery
+- `pkg/manager/` → `manager/` (~13K lines) — full-featured connection manager
+  (state machine / reconnect / dialup / netcfg). Copied in subplan 07 (was
+  originally excluded, decision reversed to gain auto-reconnect/QMAP/netcfg).
+- `pkg/device/` → `device/` (462 lines) — device discovery (manager dependency).
 
 ## Modifications
 
-- `transport_export.go` added: exports `Transport` (alias for `qmiTransport`)
+- `qmi/transport_export.go` added: exports `Transport` (alias for `qmiTransport`)
   and `NewClientFromTransport()` — the injection point for user-space USB
   transport (bypasses /dev/cdc-wdm0 kernel driver dependency).
-- No other source files modified.
+- `manager/usb_entry.go` added: `NewWithClient(cfg, logger, client)` — hook-based
+  injection of a pre-constructed client, bypassing openClientAndAllocateServices'
+  /dev/cdc-wdm0 + Linux sysfs code (subplan 07).
+- No other source files modified (verbatim copy otherwise).

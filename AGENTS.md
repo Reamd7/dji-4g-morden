@@ -305,7 +305,7 @@ dji-modem-research/
 │   ├── sms-gateway/ # 从 sms_gateway 复制的 AT 协议层"壳"(AGPL-3.0)
 │   │   └── modem/   # SG 壳:readerLoop/SendAndWait + AT 命令全集(Phase A-E)
 │   ├── smscodec/    # 从 vohive 复制的 PDU 编解码(warthog618/sms MIT + PolyForm NC)
-│   └── quectel-qmi-go/  # 从 vohive 复制的 QMI 协议栈 + manager(license 待确认)
+│   └── quectel-qmi-go/  # 从 vohive 复制的 QMI 协议栈 + manager(upstream 无 license,风险见 LICENSE)
 │       ├── qmi/                 # 协议栈核心:QMUX 分帧 + WDS/WDA/DMS/NAS/UIM/WMS/IMS/VOICE
 │       │   ├── transport_export.go # NewClientFromTransport 注入点(绕过 /dev/cdc-wdm0)
 │       │   └── *.go             # 各 service wrapper + 测试

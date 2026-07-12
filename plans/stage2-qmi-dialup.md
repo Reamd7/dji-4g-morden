@@ -15,13 +15,13 @@
 |---|---|---|---|---|
 | 00 | Phase 0 传输模型探针 | Zadig WinUSB | ✅ 完成:**模型 B(EP0 控制封装)+ DTR** | `00-phase0-transport-probe.md` |
 | 01 | 复制 quectel-qmi-go + 导出注入点 | 无(可与 00 并行) | ✅ 完成:`NewClientFromTransport` + `Transport` 导出 | `01-copy-and-export-injection.md` |
-| 02 | QMITransport 实现(按 Phase 0) | 00(模型 B + DTR)+ 01(接口) | 待实现(已解除阻塞) | `02-qmitransport-impl.md` |
-| 03 | Read/Close 并发安全(issue/001) | 02 | 待实现+实测 | `03-read-close-concurrency.md` |
-| 04 | mock 单测 | 02/03 | 待实现 | `04-mock-unit-tests.md` |
-| 05 | WDA+WDS 手搓拨号 | 01/02/03 + 00 | 待实现+硬件 | `05-dialup-integration.md` |
-| 06 | 硬件集成测试 | 05 | 待 05 完成 | `06-hardware-tests.md` |
-| 07 | manager 复用决策(**待定**) | 05(评估依据) | 待决策,不阻塞 00-06 | `07-manager-decision.md` |
-| 08 | 文档 + 提交(收尾) | 06(+ 07) | 待 06 完成 | `08-docs-and-commit.md` |
+| 02 | QMITransport 实现(按 Phase 0) | 00(模型 B + DTR)+ 01(接口) | ✅ 完成:模型 B EP0 封装 + DTR + interrupt goroutine + ioMu | `02-qmitransport-impl.md` |
+| 03 | Read/Close 并发安全(issue/001) | 02 | ✅ 完成:ioMu 串行化 Read/Write/Close(Close 持锁等在途 transfer) | `03-read-close-concurrency.md` |
+| 04 | mock 单测 | 02/03 | ✅ 完成:11 个离线测试,-race,~93% 适配层覆盖 | `04-mock-unit-tests.md` |
+| 05 | WDA+WDS 拨号 | 01/02/03 + 00 | ✅ 完成:**拨号成功**,IP `10.147.0.1/27` + DNS + MTU 1500 + IPv6 双栈 | `05-dialup-integration.md` |
+| 06 | 硬件集成测试 | 05 | ✅ 完成:7 个测试全 PASS(transport + manager 层) | `06-hardware-tests.md` |
+| 07 | manager 复用决策(**待定**) | 05(评估依据) | ✅ 已决策:**复制 manager 全包**(~13K 行)+ device + `NewWithClient` hook 注入 | `07-manager-decision.md` |
+| 08 | 文档 + 提交(收尾) | 06(+ 07) | ✅ 完成:AGENTS.md 实测记录 + 目录树 + 各子目录 AGENTS.md | `08-docs-and-commit.md` |
 
 ## 依赖关系
 
