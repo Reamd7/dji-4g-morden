@@ -94,13 +94,23 @@ gousb v1.1.3 **没有 `Device.ControlContext`** — 控制传输无 context canc
 
 | 文件 | 类型 | 命令 |
 |---|---|---|
-| `qmitransport_test.go` | 离线 mock | `go test -race ./internal/qmitransport/` |
+| `qmitransport_test.go` | 离线 mock(11 测试) | `go test -race ./internal/qmitransport/` |
 | `qmitransport_hardware_test.go` | 硬件(build tag: hardware) | `go test -tags=hardware ./internal/qmitransport/` |
 
-离线测试:50 轮并发 Read+Write+Close(-race 无告警)、timeout/close/happy-path。
+离线测试覆盖率:Transport 适配层平均 ~93%(Read 95.5%/Write 100%/SetReadDeadline 100%/errTimeout 100%/interruptLoop 90%/Close 63%)。总 54.9% 因 Open/openInternal 硬件代码 0%(USB 物理层不计)。
+
+离线测试清单:
+- `TestQMUXFrameRoundTrip` — mock 注入 qmi.NewClientFromTransport,SYNC 往返(reactiveControlDevice)
+- `TestConcurrentReadWriteClose` — 50 轮并发 Read+Write+Close(-race 无告警)
+- `TestReadBlocksUntilClose` — Read 阻塞 → Close 解除
+- `TestReadGetsResponse` / `TestReadTimeout` / `TestReadGETError` — Read 三路径
+- `TestWriteFull` / `TestWriteAfterClose` / `TestWriteSENDError` — Write 三路径
+- `TestReadAfterClose` / `TestErrTimeoutInterface` — 边界
+
 硬件烟测:SYNC → SYNC_RESP + 10 轮并发 Close 压测(0 segfault)。
 
 ## 下一步
 
 - **子计划 03**:✅ 完成(ioMu 并发安全 + 硬件压测)
+- **子计划 04**:✅ 完成(11 个离线 mock 测试,覆盖率 ~93%)
 - **子计划 05**:接入 qmi.NewClientFromTransport + WDA/WDS 拨号

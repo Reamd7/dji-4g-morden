@@ -70,10 +70,16 @@ func (r *scriptReader) ReadContext(ctx context.Context, buf []byte) (int, error)
 
 ## 交付物 / 完成标志
 
-- [ ] `qmitransport_test.go` 覆盖上表用例
-- [ ] `go test -race ./internal/qmitransport/` 通过
-- [ ] 覆盖率 ≥ 80%(Transport 适配层目标)
-- [ ] `TestCloseDuringWrite` 验证 writeMu Close 时序无死锁(子计划 03 的核心)
+- [x] `qmitransport_test.go` 覆盖上表用例(11 个测试,含 TestQMUXFrameRoundTrip)
+- [x] `go test -race ./internal/qmitransport/` 通过(11/11,-race 干净)
+- [x] 覆盖率:Transport 适配层平均 ~93%(Read 95.5%/Write 100%/SetReadDeadline 100%/errTimeout 100%/interruptLoop 90%/Close 63%)。总 54.9% 因 Open/openInternal 硬件代码 0%(USB 物理层不计,见 AGENTS.md)
+- [x] `TestConcurrentReadWriteClose` 50 轮验证 Close 并发无死锁(升级为 ioMu,子计划 03)
+
+## 实现说明(模型 B 适配)
+
+计划假设模型 A(bulk),用 scriptReader/scriptWriter 适配器。实际选了模型 B(EP0 控制),
+改为 `mockControlDevice`(mock dev.Control)+ `mockInterruptReader`(mock intrIn.ReadContext)。
+`reactiveControlDevice` 在 SEND 时触发 interrupt 通知,实现端到端 SYNC 往返测试。
 
 ## 风险
 

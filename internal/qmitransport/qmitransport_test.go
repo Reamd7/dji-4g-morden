@@ -3,10 +3,13 @@ package qmitransport
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"dji-modem-research/third_party/quectel-qmi-go/qmi"
 )
 
 // mockControlDevice implements controlDevice for offline testing.
@@ -73,7 +76,7 @@ func (m *mockInterruptReader) ReadContext(ctx context.Context, buf []byte) (int,
 
 // newTestTransport creates a QMITransport with mock USB dependencies.
 // The interrupt goroutine is started. Call Close to stop it.
-func newTestTransport(ctrl *mockControlDevice, intr *mockInterruptReader) *QMITransport {
+func newTestTransport(ctrl controlDevice, intr *mockInterruptReader) *QMITransport {
 	readCtx, readCancel := context.WithCancel(context.Background())
 	t := &QMITransport{
 		ctrl:       ctrl,
@@ -235,5 +238,233 @@ func TestReadGetsResponse(t *testing.T) {
 	// Verify QMUX IFType.
 	if buf[0] != 0x01 {
 		t.Fatalf("IFType = 0x%02x, want 0x01", buf[0])
+	}
+}
+
+// TestReadBlocksUntilClose verifies that Read blocks indefinitely (until the
+// deadline) when no data is available, and that Close unblocks it via
+// readCancel → readCtx.Done().
+func TestReadBlocksUntilClose(t *testing.T) {
+	ctrl := &mockControlDevice{getData: []byte{0x01}}
+	intr := &mockInterruptReader{notifyCh: make(chan struct{})}
+	tr := newTestTransport(ctrl, intr)
+
+	readDone := make(chan error, 1)
+	go func() {
+		tr.SetReadDeadline(time.Now().Add(10 * time.Second)) // long deadline
+		_, err := tr.Read(make([]byte, 2048))
+		readDone <- err
+	}()
+
+	// Ensure Read is blocked in the select.
+	time.Sleep(20 * time.Millisecond)
+
+	tr.Close()
+
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, errClosed) {
+			t.Fatalf("Read returned %v, want errClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read did not return within 2s after Close")
+	}
+}
+
+// TestWriteFull verifies that Write returns the full byte count and that the
+// mock records the SEND_ENCAPSULATED_COMMAND call with correct parameters.
+func TestWriteFull(t *testing.T) {
+	frame := []byte{0x01, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x27, 0x00, 0x00, 0x00}
+	ctrl := &mockControlDevice{sendOK: true}
+	intr := &mockInterruptReader{notifyCh: make(chan struct{})}
+	tr := newTestTransport(ctrl, intr)
+	defer tr.Close()
+
+	n, err := tr.Write(frame)
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if n != len(frame) {
+		t.Fatalf("Write returned %d, want %d", n, len(frame))
+	}
+
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if len(ctrl.calls) != 1 {
+		t.Fatalf("expected 1 Control call, got %d", len(ctrl.calls))
+	}
+	c := ctrl.calls[0]
+	if c.rType != bmReqClassOut || c.request != reqSendEncap {
+		t.Fatalf("expected SEND_ENCAPSULATED (0x%02x,0x%02x), got (0x%02x,0x%02x)",
+			bmReqClassOut, reqSendEncap, c.rType, c.request)
+	}
+	if c.dataLen != len(frame) {
+		t.Fatalf("recorded data length %d, want %d", c.dataLen, len(frame))
+	}
+}
+
+// reactiveControlDevice is a mock controlDevice that triggers an interrupt
+// notification when SEND_ENCAPSULATED_COMMAND is received, simulating the
+// modem's RESPONSE_AVAILABLE notification. This lets the QMI client's
+// readLoop receive the response to its request.
+type reactiveControlDevice struct {
+	mu      sync.Mutex
+	calls   []mockControlCall
+	getData []byte
+	intrCh  chan struct{} // shared with the interrupt reader
+}
+
+func (m *reactiveControlDevice) Control(rType, request uint8, val, idx uint16, data []byte) (int, error) {
+	m.mu.Lock()
+	m.calls = append(m.calls, mockControlCall{rType, request, val, idx, len(data)})
+	m.mu.Unlock()
+
+	switch {
+	case rType == bmReqClassIn && request == reqGetEncap: // GET_ENCAPSULATED_RESPONSE
+		m.mu.Lock()
+		d := m.getData
+		m.mu.Unlock()
+		n := copy(data, d)
+		return n, nil
+	case rType == bmReqClassOut && request == reqSendEncap: // SEND_ENCAPSULATED_COMMAND
+		// Simulate the modem raising RESPONSE_AVAILABLE on the interrupt EP.
+		select {
+		case m.intrCh <- struct{}{}:
+		default:
+		}
+		return len(data), nil
+	case rType == bmReqClassOut && request == reqSetCtrlLine: // DTR
+		return 0, nil
+	default:
+		return 0, errors.New("unexpected control request")
+	}
+}
+
+// TestQMUXFrameRoundTrip injects a mock transport into qmi.NewClientFromTransport
+// and verifies the SYNC exchange works end-to-end: the client sends SYNC_REQ
+// (Write → SEND_ENCAPSULATED), the mock responds with SYNC_RESP (interrupt
+// notification → GET_ENCAPSULATED_RESPONSE), and the client's readLoop
+// delivers the response to Sync().
+func TestQMUXFrameRoundTrip(t *testing.T) {
+	// SYNC_RESP from Phase 0 probe (19 bytes, result=SUCCESS).
+	// QMUX: IFType=01 | Len=0x0012 | CtlFlg=80 | SvcType=00(CTL) | ClID=00
+	// CTL:  CtlFlg=01(response) | TxID=01 | MsgID=0x0027 | Len=0x0007
+	// TLV:  Type=02 | Len=04 | Value=0x00000000(SUCCESS)
+	syncResp := []byte{
+		0x01, 0x12, 0x00, 0x80, 0x00, 0x00,
+		0x01, 0x01, 0x27, 0x00, 0x07, 0x00,
+		0x02, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}
+
+	intrCh := make(chan struct{}, 1)
+	ctrl := &reactiveControlDevice{
+		getData: syncResp,
+		intrCh:  intrCh,
+	}
+	intr := &mockInterruptReader{notifyCh: intrCh}
+
+	readCtx, readCancel := context.WithCancel(context.Background())
+	transport := &QMITransport{
+		ctrl:       ctrl,
+		intr:       intr,
+		ifaceNum:   4,
+		readCtx:    readCtx,
+		readCancel: readCancel,
+		notifyCh:   make(chan struct{}, 1),
+		intrDone:   make(chan struct{}),
+	}
+	go transport.interruptLoop()
+	defer transport.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	opts := qmi.DefaultClientOptions()
+	client, err := qmi.NewClientFromTransport(ctx, transport, opts)
+	if err != nil {
+		t.Fatalf("NewClientFromTransport failed: %v", err)
+	}
+	defer client.Close()
+
+	// Verify SYNC_REQ was sent via SEND_ENCAPSULATED_COMMAND.
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	foundSend := false
+	for _, c := range ctrl.calls {
+		if c.rType == bmReqClassOut && c.request == reqSendEncap {
+			foundSend = true
+			if c.dataLen < 12 {
+				t.Fatalf("SEND data too short: %d bytes", c.dataLen)
+			}
+			break
+		}
+	}
+	if !foundSend {
+		t.Fatal("no SEND_ENCAPSULATED_COMMAND call recorded (SYNC not sent)")
+	}
+}
+
+// TestReadGETError verifies that Read wraps control transfer errors.
+func TestReadGETError(t *testing.T) {
+	ctrl := &errorControlDevice{getErr: errors.New("USB GET failed")}
+	intr := &mockInterruptReader{notifyCh: make(chan struct{})}
+	tr := newTestTransport(ctrl, intr)
+	defer tr.Close()
+
+	intr.notifyCh <- struct{}{}
+	tr.SetReadDeadline(time.Now().Add(time.Second))
+	_, err := tr.Read(make([]byte, 2048))
+	if err == nil {
+		t.Fatal("Read should fail when GET returns error")
+	}
+}
+
+// TestWriteSENDError verifies that Write wraps control transfer errors.
+func TestWriteSENDError(t *testing.T) {
+	ctrl := &errorControlDevice{sendErr: errors.New("USB SEND failed")}
+	intr := &mockInterruptReader{notifyCh: make(chan struct{})}
+	tr := newTestTransport(ctrl, intr)
+	defer tr.Close()
+
+	_, err := tr.Write([]byte{0x01, 0x0B})
+	if err == nil {
+		t.Fatal("Write should fail when SEND returns error")
+	}
+}
+
+// TestErrTimeoutInterface verifies errTimeout satisfies the timeout interface.
+func TestErrTimeoutInterface(t *testing.T) {
+	e := errTimeout{}
+	if e.Error() == "" {
+		t.Fatal("Error() should return non-empty string")
+	}
+	if !e.Timeout() {
+		t.Fatal("Timeout() should return true")
+	}
+	if !e.Temporary() {
+		t.Fatal("Temporary() should return true")
+	}
+	// Verify os.IsTimeout recognizes it.
+	if !os.IsTimeout(e) {
+		t.Fatal("os.IsTimeout should return true for errTimeout")
+	}
+}
+
+// errorControlDevice is a mock that returns configurable errors.
+type errorControlDevice struct {
+	getErr  error
+	sendErr error
+}
+
+func (m *errorControlDevice) Control(rType, request uint8, val, idx uint16, data []byte) (int, error) {
+	switch {
+	case rType == bmReqClassIn && request == reqGetEncap:
+		return 0, m.getErr
+	case rType == bmReqClassOut && request == reqSendEncap:
+		return 0, m.sendErr
+	case rType == bmReqClassOut && request == reqSetCtrlLine:
+		return 0, nil
+	default:
+		return 0, errors.New("unexpected control request")
 	}
 }
