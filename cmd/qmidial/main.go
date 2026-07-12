@@ -238,13 +238,12 @@ func main() {
 		runCommand("netsh", "advfirewall", "firewall", "add", "rule",
 			"name=qmi-tun-icmp-in", "protocol=icmpv4:0,any", "dir=in", "action=allow")
 
-		fmt.Println("  Testing ping 114.114.114.114 through TUN...")
-		runCommand("ping", platformPingArgs("114.114.114.114")...)
+		fmt.Println("  Testing ping baidu.com through TUN...")
+		runCommand("ping", platformPingArgs("baidu.com")...)
 		if s := mgr.Settings(); s != nil && len(s.IPv4Address) > 0 {
-			fmt.Printf("  Testing ping -S %s 114.114.114.114...\n", s.IPv4Address)
-			runCommand("ping", platformPingArgsWithSource("114.114.114.114", s.IPv4Address.String())...)
+			fmt.Printf("  Testing ping -S %s baidu.com...\n", s.IPv4Address)
+			runCommand("ping", platformPingArgsWithSource("baidu.com", s.IPv4Address.String())...)
 		}
-		fmt.Println("  Testing DNS resolution (nslookup baidu.com)...")
 		runCommand("nslookup", "baidu.com")
 		fmt.Println("  Testing TCP (curl http://www.baidu.com)...")
 		runCommand("curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}s", "http://www.baidu.com")
