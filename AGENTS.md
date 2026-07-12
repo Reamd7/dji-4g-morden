@@ -59,6 +59,14 @@
 - **短信发送**:`Send` 完整 CMGS 两步握手(`AT+CMGS=N` → 等 `>` → PDU+Ctrl-Z → OK)成功发出短信到 `+8613800000001`
 - **readLine 修正**(上游 sms_gateway 在 USB 场景的 bug):`>` 提示符以空格结尾非 `\n`,传统串口靠短读部分返回能工作,USB CDC-AT bulk endpoint 上 `ReadString('\n')` 会把 `>` 永久卡在 bufio 缓冲区。修正:`readLine` 在部分读(无 `\n`)时,若 TrimSpace 后内容是 `>`,当一行返回。这是 USB transport 方案相对串口的必要适配。
 
+**smscodec 升级完成(路线 B,2026-07-12,commit e73e4d9)**:PDU 编解码层从 SG 手写 `pdu.go` 升级到 vohive `smscodec`(委托 warthog618/sms,MIT)。三缺陷全部消除:GSM-7 扩展表完整(TS 23.038 §6.2.1)、长短信自动分段(`BuildSubmitTPDUs`)+ 自动重组(`Reassembler`)、16-bit ref UDH。`pdu.go` 改为 ~100 行 facade(保留 `DecodedSMS`/`ConcatInfo`/`DecodeDeliver` 对外形状,内部委托 smscodec);`Send` 改多段循环 CMGS(段间 500ms)。详见 `plans/archive/upgrade-smscodec.md`、`third_party/smscodec/AGENTS.md`。
+
+**USB transport 方向 F 修复(2026-07-12)**:Read 从 200ms 短轮询改为**长阻塞读**(`readCtx = context.WithCancel` 无超时,运行期 0 次 `libusb_cancel_transfer`,只有 Close 时 cancel 一次)。原因:200ms 轮询在 WinUSB 上 send 时 read-cancel 撞 write transfer 偶发 segfault;判别实验证实 10× 降频(2000ms)消除崩溃,方向 F 把 cancel 降到 0 根治。配套:`readLine` 改逐字节读(不再依赖超时检测 `>`),同时对串口和 USB 工作。详见 `issue/001-gousb-close-transfer-cancel-crash.md`、`internal/usbtransport/AGENTS.md`。
+
+**AT 命令全集对齐(2026-07-12)**:按 `plans/archive/at-commands-roadmap.md` Phase A-E 补 11 条 vohive 源码发过但 SG 没有的命令(全部带离线测试 `roadmap_test.go` + 硬件验证):Phase A 设备信息(IMSI/SoftwareVersion)、Phase B 网络注册(CSRegistration/PSAttached/DefinePDP/ListPDPs/QueryNetworkInfo)、Phase C 配置(SetFunctionLevel/SetQCFG)、Phase D SIM APDU(CSIM/ReadSIMFile/WriteSIMFile)、Phase E USSD(SendUSSD)。状态对照见 `docs/10-at-commands-alignment.md`。
+
+**+CMTI 实时收信管道接入(2026-07-12)**:`SetSMSCallback(cb)` 启用 +CMTI 自动收信(+CMTI URC → CMGR 读 → DecodeDeliver → smscodec.Reassembler 重组 → CMGD 删除 → cb 回调)。`handleIncomingSMS` 在独立 goroutine 避免 readerLoop 死锁。Reassembler 真正接入(原计划留阶段 2,已提前完成)。
+
 ### 目录结构
 
 - `docs/` —— 调研报告(中文 markdown)
@@ -260,36 +268,67 @@ dji-modem-research/
 ├── .mise.toml       # mise 工具链配置
 ├── .githooks/       # pre-commit hook(强制 go test -race 通过)
 ├── Makefile         # 标准化 test/cover/lint 等命令
-├── go.mod           # module dji-modem-research,依赖 gousb/zerolog/serial
+├── go.mod           # module dji-modem-research
 ├── main.go          # hello world
 ├── internal/
 │   ├── usbdesc/     # USB 描述符格式化(纯逻辑,从 usbprobe 抽出,100% 覆盖)
 │   ├── testutil/    # ScriptPort mock io.ReadWriteCloser(供 transport 测试)
 │   └── usbtransport/# ATTransport:USB bulk endpoint → io.ReadWriteCloser
-│       ├── usbtransport.go             # Open/Read(200ms 短轮询)/Write/Close
+│       ├── usbtransport.go             # Open/Read(长阻塞读,方向F)/Write/Close
 │       ├── usbtransport_test.go        # mock 单测(ScriptPort + modem NewFromIO 集成)
-│       └── usbtransport_hardware_test.go # 真实 EC25 集成测试(build tag: hardware)
+│       ├── usbtransport_hardware_test.go # AT 通路硬件集成测试(build tag: hardware)
+│       └── sms_hardware_test.go        # 短信收发硬件集成测试(build tag: hardware)
 ├── third_party/
-│   └── sms-gateway/ # 从 sms_gateway 复制的 AT 协议层(AGPL-3.0)
-│       ├── LICENSE
-│       └── modem/   # modem.go(+NewFromIO+port接口化) + sms.go + pdu.go
+│   ├── sms-gateway/ # 从 sms_gateway 复制的 AT 协议层"壳"(AGPL-3.0)
+│   │   ├── LICENSE
+│   │   └── modem/   # SG 壳:readerLoop/SendAndWait/transport + AT 命令全集
+│   │       ├── modem.go          # 并发模型 + NewFromIO + readLine(USB 适配)
+│   │       ├── sms.go            # Initialize/Send(多段)/ListStored/ReadStored/设备查询/SetSMSCallback(+CMTI 管道)
+│   │       ├── pdu.go            # PDU facade(~100行,委托 smscodec;保留 DecodedSMS/ConcatInfo/DecodeDeliver)
+│   │       ├── network.go        # 网络注册/拨号状态(CREG/CGATT/CGDCONT/QNWINFO,Phase B)
+│   │       ├── sim.go            # SIM APDU 透传(CSIM/CRSM,Phase D)
+│   │       ├── config.go         # 配置/复位(CFUN/QCFG,Phase C)
+│   │       ├── sms_test.go       # SG 原有 + 扩展的离线测试
+│   │       ├── pdu_test.go       # facade 离线测试(GSM-7 扩展表/长短信等回归)
+│   │       └── roadmap_test.go   # 11 条 AT 命令全集的离线测试(Phase A-E)
+│   └── smscodec/     # 从 vohive verbatim 复制的 PDU 编解码"芯"(PolyForm NC + warthog618 MIT)
+│       ├── LICENSE              # vohive PolyForm Noncommercial
+│       ├── pdu.go               # DecodeDeliverTPDU/BuildSubmitTPDUs + RPDU 函数
+│       ├── reassembler.go       # 长短信分片重组
+│       ├── pdu_trim.go          # 国产模组 GSM-7 spare bit 清零 + PDU 长度裁剪
+│       ├── binary_classifier.go # 8-bit 二进制短信分类(OMA CP/WAP/MMS,当前不验证)
+│       ├── wbxml_omacp.go       # OMA CP WBXML 解码(同上)
+│       └── *_test.go            # reassembler/pdu 编码/pdu_trim 离线回归向量
 ├── cmd/
 │   ├── usbprobe/    # USB 接口/endpoint 枚举探针(硬件,go run)
 │   └── attest/      # MI_02 AT 通路验证(硬件,go run)
-└── docs/            # 研究文档
+├── issue/
+│   └── 001-gousb-close-transfer-cancel-crash.md  # WinUSB cancel 崩溃判别实验(方向F 根因)
+├── plans/
+│   └── archive/     # 已完成的实施计划(gousb/usb-transport/upgrade-smscodec/at-commands-roadmap)
+└── docs/            # 研究文档(01-03 方案/硬件/源码,04-07 AT 标准与选型,08-10 AT 命令索引与对齐)
+    ├── 01-userland-usb-modem-feasibility.md
+    ├── 04-at-command-standards.md       # AT 命令电信标准规范索引
+    ├── 05-sms-gateway-modem-analysis.md # SG modem 剖析
+    ├── 06-vohive-modem-analysis.md      # vohive modem + smscodec 剖析
+    ├── 07-at-implementation-comparison.md # 三实现对比 + 选型(路线 A/B/C)
+    ├── 08-ec25-at-commands-index.md     # EC25 AT 命令索引
+    ├── 09-ec20-at-commands-index.md     # EC20 AT 命令索引
+    ├── 10-at-commands-alignment.md      # 逐命令对齐状态(SG/VH 溯源 + 大类评分)
+    ├── EC25_EC21_AT_Commands_Manual_V1.2.pdf
+    └── EC20_AT_Commands_Manual.pdf
 ```
 
 - `go.mod` 模块名:`dji-modem-research`
-- 依赖:`github.com/google/gousb`(USB)、`github.com/rs/zerolog` + `go.bug.st/serial`(modem 包保留)
+- 依赖:`github.com/google/gousb`(USB)、`github.com/rs/zerolog` + `go.bug.st/serial`(modem 包保留)、`github.com/warthog618/sms`(smscodec 用,MIT)
 - 运行探针:`mise exec -- go run ./cmd/usbprobe/`
 - 运行 AT 测试:`mise exec -- go run ./cmd/attest/`
 - 跑 mock 单测:`make test-race`
 - 跑硬件集成测试(需 EC25 + WinUSB):`make test-hardware`
 
-### third_party 复制方案(非 replace)
+### third_party 复制方案(非 replace,SG 壳 + smscodec 芯)
 
-`sms-gateway/modem/` 从 `source/sms_gateway/agent/internal/modem/` **复制**(非 go.mod replace),理由:
-- 可移植(无绝对路径依赖,换机器/CI 不断)
-- 改动最小:仅 `port serial.Port` → `port io.ReadWriteCloser` + 加 `NewFromIO` 构造函数,其余原样保留(含 ICMP ping / zerolog / Open 串口路径)
-- AGPL-3.0 LICENSE 随复制,合规
-- 选型依据见 `docs/07`(标准符合度对比,选 sms_gateway 而非 vohive/uicc-go)
+两个 third_party 包都从上级 `source/` **复制**(非 go.mod replace),理由:可移植(无绝对路径依赖)、可改(改副本不影响上游)、依赖最小。选型见 `docs/07`。
+
+- **`sms-gateway/modem/`**(AGPL-3.0):AT 协议"壳"。核心改动:`port serial.Port` → `io.ReadWriteCloser` + `NewFromIO`(transport 注入);`readLine` USB 适配(`>` 提示符 + 逐字节读,方向F);`pdu.go` facade 化(委托 smscodec);补 11 条 AT 命令(network/sim/config 新文件);`SetSMSCallback` +CMTI 实时收信管道。保留 ICMP ping / zerolog / Open 串口路径。
+- **`smscodec/`**(vohive PolyForm NC + warthog618 MIT):PDU 编解码"芯"。**verbatim 一行不改**,委托 warthog618/sms 完整实现 TS 23.040(GSM-7 扩展表/长短信分段/重组),加国产模组容错(pdu_trim.go)。零 vohive 内部包依赖(复制前提)。
