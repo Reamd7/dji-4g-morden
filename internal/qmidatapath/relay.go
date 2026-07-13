@@ -33,6 +33,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // BulkReader abstracts the gousb IN endpoint (EP 0x88) so relay logic can be
@@ -118,7 +119,6 @@ func (b *Bridge) Start(parent context.Context) error {
 // tun.Read which doesn't respect context cancellation. Closing the TUN
 // unblocks the read, allowing the goroutine to exit so Stop's wg.Wait()
 // can return. Netstack-backed sinks don't have this issue (channel close
-// immediately unblocks ReadContext).
 func (b *Bridge) Stop() {
 	b.mu.Lock()
 	if !b.started {
@@ -131,7 +131,19 @@ func (b *Bridge) Stop() {
 	if b.cancel != nil {
 		b.cancel()
 	}
-	b.wg.Wait()
+	// Wait with timeout — USB ReadContext on some platforms may not
+	// immediately honor context cancellation (WinUSB). 5s is generous;
+	// if goroutines haven't exited by then, something is stuck.
+	done := make(chan struct{})
+	go func() {
+		b.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		log.Printf("qmidatapath: Bridge.Stop() timed out after 5s — goroutine may be stuck on USB read")
+	}
 }
 
 // Flow 1: sink → modem (uplink).

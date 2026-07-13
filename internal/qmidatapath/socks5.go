@@ -22,7 +22,7 @@ func RunSOCKS5(ctx context.Context, sink *NetstackPacketSink, listenAddr string)
 		return fmt.Errorf("socks5: New: %w", err)
 	}
 
-	// Custom listener so we can honor ctx cancellation
+	// Custom listener so we can honor ctx cancellation.
 	lc := net.ListenConfig{}
 	ln, err := lc.Listen(ctx, "tcp", listenAddr)
 	if err != nil {

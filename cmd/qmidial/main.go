@@ -316,9 +316,23 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Create netstack sink with modem-assigned IP
-		localIP := netip.AddrFrom4([4]byte{s.IPv4Address[0], s.IPv4Address[1], s.IPv4Address[2], s.IPv4Address[3]})
-		netstackSink, err := qmidatapath.NewNetstackPacketSink(localIP, int(s.MTU), true, netip.Addr{})
+		// Create netstack sink with modem-assigned IPs
+		ipBytes := s.IPv4Address.To4()
+		if ipBytes == nil {
+			fmt.Fprintf(os.Stderr, "Invalid IPv4: %v\n", s.IPv4Address)
+			os.Exit(1)
+		}
+		localIP := netip.AddrFrom4([4]byte{ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3]})
+
+		// IPv6 address from manager (if available)
+		var v6Addr netip.Addr
+		if s6 := mgr.SettingsV6(); s6 != nil && len(s6.IPv6Address) > 0 {
+			if v6, ok := netip.AddrFromSlice(s6.IPv6Address); ok {
+				v6Addr = v6.Unmap()
+			}
+		}
+		fmt.Printf("      netstack: IPv4=%s, IPv6=%s\n", localIP, v6Addr)
+		netstackSink, err := qmidatapath.NewNetstackPacketSink(localIP, int(s.MTU), v6Addr.IsValid(), v6Addr)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "NewNetstackPacketSink failed: %v\n", err)
 			mgr.Stop()

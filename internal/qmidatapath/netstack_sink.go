@@ -114,7 +114,6 @@ func (s *NetstackPacketSink) Stack() *stack.Stack {
 
 // ReadPacket: netstack → USB (uplink).
 // Blocks until netstack emits a packet on the channel, or ctx is canceled.
-// netstack emits a packet when an app (e.g. SOCKS5 → gonet.Dial) sends data.
 func (s *NetstackPacketSink) ReadPacket(ctx context.Context) ([]byte, error) {
 	pkt := s.ep.ReadContext(ctx)
 	if pkt == nil {
@@ -124,7 +123,9 @@ func (s *NetstackPacketSink) ReadPacket(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("netstack: channel closed")
 	}
 	defer pkt.DecRef()
-	return pkt.Data().AsRange().ToSlice(), nil
+	// ToView() returns the FULL packet including all headers (network + transport + data).
+	view := pkt.ToView()
+	return view.AsSlice(), nil
 }
 
 // WritePacket: USB → netstack (downlink).
@@ -156,9 +157,6 @@ func (s *NetstackPacketSink) Name() string {
 	return "netstack"
 }
 
-// Close releases netstack resources.
-// ep.Close() makes pending ReadContext return nil → ReadPacket returns error
-// → Bridge's sinkToModem goroutine exits naturally.
 func (s *NetstackPacketSink) Close() error {
 	s.ep.Close()
 	s.stk.Close()
