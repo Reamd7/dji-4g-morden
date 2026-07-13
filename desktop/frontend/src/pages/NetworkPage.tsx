@@ -10,6 +10,8 @@ function NetworkPage() {
   const [socksAddr, setSocksAddr] = useState('127.0.0.1:1080');
   const [socksRunning, setSocksRunning] = useState(false);
   const [stats, setStats] = useState<RelayStats | null>(null);
+  const [tunRunning, setTunRunning] = useState(false);
+  const [tunStarting, setTunStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -78,6 +80,29 @@ function NetworkPage() {
       await DialerService.StopSOCKS5();
       setSocksRunning(false);
       setStats(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  const startTUN = useCallback(async () => {
+    setTunStarting(true);
+    setError(null);
+    try {
+      await DialerService.StartTUN(apn);
+      setTunRunning(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTunStarting(false);
+    }
+  }, [apn]);
+
+  const stopTUN = useCallback(async () => {
+    setError(null);
+    try {
+      await DialerService.StopTUN();
+      setTunRunning(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -164,6 +189,28 @@ function NetworkPage() {
           </Flex>
         </Card>
       )}
+
+      <Card size="3">
+        <Flex direction="column" gap="3">
+          <Flex justify="between" align="center">
+            <Heading size="4">TUN 模式(系统级)</Heading>
+            <Badge color={tunRunning ? 'green' : 'gray'} variant="soft">
+              {tunRunning ? '运行中' : '未启动'}
+            </Badge>
+          </Flex>
+          <Text size="2" color="gray">
+            创建系统虚拟网卡,所有流量自动走 4G(无需单独配代理)。<Text color="amber">需管理员密码</Text>。
+          </Text>
+          <Text size="1" color="gray">断 WiFi 时也能上网(TUN 独立于主机网络)</Text>
+          {tunRunning ? (
+            <Button color="red" variant="soft" onClick={stopTUN}>停止 TUN</Button>
+          ) : (
+            <Button onClick={startTUN} disabled={tunStarting}>
+              {tunStarting ? '启动中…(输入密码 + 拨号约 30s)' : '启动 TUN(弹密码框)'}
+            </Button>
+          )}
+        </Flex>
+      </Card>
     </Flex>
   );
 }

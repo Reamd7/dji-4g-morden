@@ -10,7 +10,7 @@ export {
     SMSService
 };
 
-export type {
+export {
     ConnectionInfo,
     DeviceInfo,
     RelayStats,

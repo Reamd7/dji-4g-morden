@@ -8,7 +8,7 @@
 
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore: Unused imports
-import { Call as $Call, CancellablePromise as $CancellablePromise } from "@wailsio/runtime";
+import { Call as $Call, CancellablePromise as $CancellablePromise, Create as $Create } from "@wailsio/runtime";
 
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore: Unused imports
@@ -26,14 +26,18 @@ export function Dial(apn: string): $CancellablePromise<void> {
  * GetConnection 返回拨号后的网络配置(IP/Gateway/DNS/MTU/IPv6)。
  */
 export function GetConnection(): $CancellablePromise<$models.ConnectionInfo | null> {
-    return $Call.ByID(315581859);
+    return $Call.ByID(315581859).then(($result: any) => {
+        return $$createType1($result);
+    });
 }
 
 /**
  * GetStats 返回 relay 流量统计。
  */
 export function GetStats(): $CancellablePromise<$models.RelayStats | null> {
-    return $Call.ByID(4058530830);
+    return $Call.ByID(4058530830).then(($result: any) => {
+        return $$createType3($result);
+    });
 }
 
 /**
@@ -58,10 +62,25 @@ export function IsSOCKS5Running(): $CancellablePromise<boolean> {
 }
 
 /**
+ * IsTUNRunning 返回 TUN helper 是否在运行。
+ */
+export function IsTUNRunning(): $CancellablePromise<boolean> {
+    return $Call.ByID(1265052303);
+}
+
+/**
  * StartSOCKS5 启动 SOCKS5 代理(netstack,无需 admin)。需先 Dial。
  */
 export function StartSOCKS5(addr: string): $CancellablePromise<void> {
     return $Call.ByID(3637284927, addr);
+}
+
+/**
+ * StartTUN 启动 TUN 模式:先 build tun-helper binary,再 osascript sudo 启动(弹密码框)。
+ * tun-helper 以 root 独立进程运行(创建 utun + 拨号 + relay + DNS),app 监控其 PID。
+ */
+export function StartTUN(apn: string): $CancellablePromise<void> {
+    return $Call.ByID(233528346, apn);
 }
 
 /**
@@ -70,3 +89,16 @@ export function StartSOCKS5(addr: string): $CancellablePromise<void> {
 export function StopSOCKS5(): $CancellablePromise<void> {
     return $Call.ByID(849760785);
 }
+
+/**
+ * StopTUN 停止 TUN(osascript sudo kill root 进程)。
+ */
+export function StopTUN(): $CancellablePromise<void> {
+    return $Call.ByID(2236449728);
+}
+
+// Private type creation functions
+const $$createType0 = $models.ConnectionInfo.createFrom;
+const $$createType1 = $Create.Nullable($$createType0);
+const $$createType2 = $models.RelayStats.createFrom;
+const $$createType3 = $Create.Nullable($$createType2);
