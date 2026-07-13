@@ -32,3 +32,18 @@
 
 # Carrier-assigned IPv6 prefix
 # 2001:db8:
+
+# Packet Data Handle (QMI WDS session handle — hex, rotates per session)
+# 0x86[0-9a-f]{6}
+
+# 4G egress IP (public IP the carrier NATs you to — reveals carrier + region)
+# 1\.2\.3\.4
+
+# Host broadband egress IP (your home/office public IP, for comparison)
+# 5\.6\.7\.8
+
+# Carrier / ISP name (Chinese carrier names also leak region)
+# 中国电信
+
+# Geographic region / locale
+# 广东

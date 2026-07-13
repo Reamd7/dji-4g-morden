@@ -59,7 +59,10 @@ else
   PII_REGEX=$(grep -v '^#' "$PII_FILE" | grep -v '^$' | paste -sd'|' -)
 
   if [ -n "$PII_REGEX" ]; then
-    PII_HITS=$(git diff --cached -U0 --diff-filter=ACM -- \
+    # --no-ext-diff forces git's built-in patch format (+/- lines); external
+    # diff drivers (delta/difftastic) emit non-standard output without "+"
+    # prefixes that silently defeats this grep (root cause of past PII leaks).
+    PII_HITS=$(git diff --cached --no-ext-diff -U0 --diff-filter=ACM -- \
       '*.go' '*.md' '*.txt' '*.json' '*.yaml' '*.yml' '*.bat' '*.sh' '*.inf' \
       | grep -E '^\+' | grep -iE "$PII_REGEX" 2>/dev/null || true)
 
