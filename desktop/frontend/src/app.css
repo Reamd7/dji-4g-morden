@@ -1,18 +1,21 @@
 /* 窗口拖动 + 文字选中修复 */
-/* 问题:wails MacTitleBarHiddenInset 让整个 webview 可拖动,导致无法选中文字 */
-/* 修复:默认所有元素 no-drag(可选中/点击/输入),仅顶部 .window-drag 可拖窗口 */
+/* wails 用 --wails-draggable CSS 变量(非标准 -webkit-app-region) */
+/* 根因:MacTitleBarHiddenInset 默认整个 webview 可拖,需用 wails 变量关闭 */
 
 body {
   -webkit-user-select: text;
   user-select: text;
 }
 
+/* 全部 no-drag(可选中/点击/输入)— 双保险:wails 变量 + 标准 webkit */
 * {
+  --wails-draggable: no-drag;
   -webkit-app-region: no-drag;
 }
 
 /* 顶部拖动区(模拟标题栏) */
 .window-drag {
+  --wails-draggable: drag;
   -webkit-app-region: drag;
   height: 28px;
   flex-shrink: 0;

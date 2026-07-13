@@ -145,7 +145,7 @@ function NetworkPage() {
             {socksRunning ? (
               <Flex direction="column" gap="1">
                 <Text size="2" color="gray">监听地址:<Text as="span" color="iris" highContrast>{socksAddr}</Text></Text>
-                <Text size="1" color="gray">curl --socks5-hostname {socksAddr} http://example.com</Text>
+                <Text size="1" color="gray">curl --socks5-hostname {socksAddr} http://www.baidu.com</Text>
               </Flex>
             ) : (
               <TextField.Root placeholder="监听地址" value={socksAddr} onChange={(e) => setSocksAddr(e.target.value)} />

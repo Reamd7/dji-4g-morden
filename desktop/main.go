@@ -36,11 +36,8 @@ func main() {
 		Title:  "DJI 4G Desktop",
 		Width:  1000,
 		Height: 618,
-		Mac: application.MacWindow{
-			InvisibleTitleBarHeight: 50,
-			Backdrop:                application.MacBackdropTranslucent,
-			TitleBar:                 application.MacTitleBarHiddenInset,
-		},
+		// 去掉 MacTitleBarHiddenInset:它让整个 webview 可拖动,导致无法选中文字。
+		// 改用标准标题栏(原生拖动 + close/minimize 按钮,内容区可正常交互)。
 		BackgroundColour: application.NewRGB(6, 7, 15),
 		URL:              "/",
 	})
