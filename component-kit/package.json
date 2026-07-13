@@ -6,7 +6,8 @@
   "description": "DJI 4G Desktop 组件展示库 (Storybook)",
   "scripts": {
     "storybook": "storybook dev -p 6006",
-    "build-storybook": "storybook build"
+    "build-storybook": "storybook build",
+    "lint": "eslint src/"
   },
   "dependencies": {
     "@radix-ui/themes": "^3.3.0",
@@ -18,7 +19,9 @@
     "@storybook/react-vite": "^10.0.0",
     "@types/react": "^18.2.43",
     "@types/react-dom": "^18.2.17",
+    "@typescript-eslint/parser": "^8.63.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^10.7.0",
     "storybook": "^10.0.0",
     "typescript": "^5.2.2",
     "vite": "^5.4.0"
