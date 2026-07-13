@@ -2,52 +2,60 @@
 
 ## 包职责
 
-TUN 虚拟网卡 ↔ QMI bulk EP 之间的双向 raw IP 中继。上游 quectel-qmi-go 是纯控制面(依赖内核 qmi_wwan 搬数据),本包在用户态实现数据搬运层。
+USB bulk EP 与主机侧网络栈之间的双向 raw IP 中继。
+- **后端 1(阶段 3)**:`TUNPacketSink` → wireguard/tun → 内核 TCP/IP(需 admin)
+- **后端 2(阶段 4)**:`NetstackPacketSink` → gVisor netstack → SOCKS5(无需 admin)
 
-## 核心结构
+两个后端共享同一条 USB bulk 数据通路,通过 `PacketSink` 接口切换最后一跳。Bridge 不知道 TUN/netstack 的存在。
 
-- `relay.go`(~230 行):全部代码合并在此文件
-  - `BulkReader` / `BulkWriter` / `tunDevice` 接口(可测性:注入 mock)
-  - `Bridge` 结构体:New(tun, bulkIn, bulkOut, offset, mtu, zlp) → Start → Stop
-  - `tunToModem`:TUN.Read → bulkOut.Write(+ ZLP)
-  - `modemToTun`:bulkIn.ReadContext → TUN.Write
-  - `Stats()`:TX/RX 包计数器(atomic)
+## 核心文件
+
+- `sink.go` — `PacketSink` 接口(`ReadPacket(ctx)` 上行 / `WritePacket(pkt)` 下行 / `Name` / `Close`)
+- `tun_sink.go` — `TUNPacketSink`:包装 wireguard/tun.Device,内部处理 macOS utun 4 字节 offset headroom
+- `netstack_sink.go` — `NetstackPacketSink`:gVisor channel link endpoint + `NetstackDialer()`(gonet 包装,供 SOCKS5 `Config.Dial`)
+- `socks5.go` — `RunSOCKS5`:armon/go-socks5 包装,listener 跑 host 网络栈,`Dial` 注入 netstack dialer(所有 CONNECT 走 4G)
+- `relay.go` — `Bridge`:`PacketSink ↔ bulk EP`,ZLP + Stats
+- `*_test.go` — mock + 硬件测试(见下)
 
 ## 关键设计决策
 
-### Bridge 依赖注入(非内部创建 TUN)
+### PacketSink 抽象(阶段 4)
 
-TUN 作为 `tunDevice` 接口注入,而非 Bridge 内部 `tun.CreateTUN()`。relay 逻辑完全离线可测——不需要管理员权限/Wintun.dll。
+Bridge 只跟 `PacketSink` 接口对话,不依赖 TUN/netstack 具体实现:
+- `ReadPacket(ctx)`:host → modem(上行;netstack `channel.ReadContext` / TUN batch read)
+- `WritePacket(pkt)`:modem → host(下行;`InjectInbound` / TUN batch write)
+- `Close` 必须解除 `ReadPacket` 阻塞(否则 `bridge.Stop` 的 `wg.Wait` 死锁)
 
-### ZLP 参数化(探针驱动)
+### ZLP(探针驱动,两后端共用)
 
-`zlp bool` 从子计划 00 D2 探针结果传入。QDC507 的 bulk OUT maxPacketSize=512,当 TX 包长度是 512 整数倍时需追加 0 字节 Write(ZLP)。Linux `qmi_wwan_q.c` 的 `FLAG_SEND_ZLP` 印证。
+`zlp=true`:TX 包长度是 bulk OUT maxPacketSize(512)整数倍时追加 0 字节 Write(QDC507 物理约束,子计划 00 D2 实测;Linux `qmi_wwan_q.c` 的 `FLAG_SEND_ZLP` 印证)。ZLP 逻辑在 `sinkToModem` 内,与后端无关。
 
-### raw-IP 直传
+### raw-IP 直传(两后端共用)
 
-WDA SetDataFormat(LinkProtocolIP)后,bulk EP 上的数据 = 裸 IP 包(无以太网头、无 QMAP 头)。TUN 也是 layer-3。relay 直接转发,无需任何头处理。
+WDA SetDataFormat(LinkProtocolIP)后 bulk EP = 裸 IP 包(无以太网头、无 QMAP 头)。TUN 与 netstack channel 都是 layer-3,relay 直传无需任何头处理。
 
-### Close 时序(防死锁)
+### Close 时序(TUN vs netstack 差异,均已实测)
 
-`tun.Read` 不响应 context(阻塞直到 TUN 关闭)。必须按以下顺序清理:
-1. `tun.Close()` — 解除 tunToModem 的 Read 阻塞
-2. `bridge.Stop()` — cancel context + wg.Wait() 等两个 goroutine 退出
-3. `QMITransport.Close()` — 释放 USB iface
+- **TUNPacketSink**:`tun.Read` 不响应 ctx(阻塞直到 TUN 关闭)。必须 `tun.Close() → bridge.Stop() → transport.Close()`。反过来死锁(Stop 的 `wg.Wait` 等 tunToModem,tunToModem 阻塞在 Read,Read 等 TUN 关闭)。
+- **NetstackPacketSink**:`channel.ReadContext` 支持 ctx 取消(Close 关 channel → 返回 nil → goroutine 自然退出)。`sink.Close() → bridge.Stop() → transport.Close()` 即可,更干净。
+- **`Bridge.Stop()` 带 5s 超时**(`wg.Wait` 包在 `select` 超时里):防 WinUSB 上 `ReadContext` 不响应 ctx 取消导致挂起(2026-07-13 硬件测试 fix,commit `34341de`)。macOS 正常路径不触发超时(SOCKS5 SIGINT 关闭实测 5s 内退出)。
 
-**反过来会死锁**:Stop 的 wg.Wait 等 tunToModem 退出,tunToModem 阻塞在 Read,Read 等 TUN 关闭。
+### DNS(Phase 2:host resolver)
 
-### offset(macOS headroom)
-
-macOS utun 在每帧前加 4 字节 AF-family prefix。offset=4 留出 headroom,三平台通用(offset=0 on Linux/Windows 也安全)。
+`NetstackDialer()` 用 `net.DefaultResolver`(走 host 网络 DNS)解析域名,经 gonet 拨号走 4G。SOCKS5 客户端用 `--socks5-hostname` 把域名透传给 dialer(由我们解析,而非客户端)。Phase 3 待升级为 4G DNS。
 
 ## 测试
 
-- `relay_test.go`:13 个 mock 测试,88.7% 覆盖率,`-race` 通过
-- `relay_hardware_test.go`:2 个硬件测试(build tag: hardware)
+- `relay_test.go`:PacketSink mock 测试(Bridge 收发/ZLP/错误路径/Stop)
+- `netstack_sink_test.go`:netstack 收发 + ctx cancel + Close
+- `netstack_api_smoke_test.go`:gVisor API smoke(编译期 + 基本收发)
+- `socks5_test.go`:SOCKS5 CONNECT 握手(本地 echo server + mock dialer)
+- `relay_hardware_test.go`:硬件 TUN relay(build tag: hardware)
+- `hwenv_test.go`:硬件环境探测 helper
 
 ## 不做的事
 
-- 不做 TCP/IP 栈(只搬 raw IP 字节)
-- 不做路由配置(manager.configureNetwork 负责)
-- 不做 DNS 配置(cmd/qmidial/dns.go 负责)
-- 不做 QMAP 头处理(raw-IP 已确认,QMAP 是降级分支,代码在计划 §六)
+- 不做内核 TCP/IP(TUN 模式交给内核 / netstack 模式交给 gVisor)
+- 不做路由配置(manager.configureNetwork / netstack 内部路由表)
+- 不做 DNS 配置(netstack 内部 resolver / cmd 层 dns.go)
+- 不做 QMAP 头处理(raw-IP 已确认;QMAP 是降级分支)
