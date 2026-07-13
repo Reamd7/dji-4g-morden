@@ -374,7 +374,20 @@ func (s *DialerService) findResidualTUNKillCmd() string {
 func (s *DialerService) IsTUNRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.tunPID != 0 && s.isTUNProcessAlive()
+	// 1. app 管理的 PID
+	if s.tunPID != 0 && syscall.Kill(s.tunPID, 0) == nil {
+		return true
+	}
+	// 2. pid 文件兜底(tun-helper 自己写的)
+	if pid := s.readTUNPIDFile(); pid != 0 && syscall.Kill(pid, 0) == nil {
+		s.tunPID = pid // 恢复追踪
+		return true
+	}
+	// 3. pgrep 兜底(找任何存活 tun-helper)
+	if cmd := s.findResidualTUNKillCmd(); cmd != "" {
+		return true
+	}
+	return false
 }
 
 func (s *DialerService) isTUNProcessAlive() bool {
