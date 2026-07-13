@@ -128,8 +128,8 @@ function NetworkPage() {
 
       <Tabs.Root defaultValue="socks5">
         <Tabs.List>
-          <Tabs.Trigger value="socks5">SOCKS5 代理</Tabs.Trigger>
-          <Tabs.Trigger value="tun">TUN 系统代理</Tabs.Trigger>
+          <Tabs.Trigger value="socks5" disabled={tunRunning}>SOCKS5 代理</Tabs.Trigger>
+          <Tabs.Trigger value="tun" disabled={connected || socksRunning}>TUN 系统代理</Tabs.Trigger>
         </Tabs.List>
 
         {/* ── SOCKS5 模式:拨号 → SOCKS5 ── */}
