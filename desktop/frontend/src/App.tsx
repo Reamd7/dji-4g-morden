@@ -1,121 +1,82 @@
-import { useState, useEffect, useRef } from 'react'
-import {Events, WML} from "@wailsio/runtime";
-import {GreetService} from "../bindings/dji-modem-research/desktop";
-
-// Show the actual Wails version this project was generated against.
-const wailsVersion = "v3.0.0-alpha2.117";
+import { useState, useEffect, useCallback } from 'react';
+import { Card, Button, Text, Flex, Badge, Heading, Callout } from '@radix-ui/themes';
+import { DeviceService, type USBDeviceInfo } from '../bindings/dji-modem-research/desktop/services';
 
 function App() {
-  const [name, setName] = useState<string>('');
-  const [time, setTime] = useState<string>('Listening for Time event...');
+  const [devices, setDevices] = useState<USBDeviceInfo[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const titleNameRef = useRef<HTMLSpanElement | null>(null);
-  const toastRef = useRef<HTMLDivElement | null>(null);
-  const resultRef = useRef<HTMLSpanElement | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-
-  // Crossfade the framework word in the heading ("Wails + React") to the name
-  // the user entered ("Wails + <name>"): the old word fades out while the new one
-  // fades in over the same spot.
-  const swapTitleName = (name: string) => {
-    const titleNameElement = titleNameRef.current;
-    if (!titleNameElement) {
-      return;
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const list = await DeviceService.ListDevices();
+      setDevices(list ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setDevices([]);
+    } finally {
+      setLoading(false);
     }
-    const current = titleNameElement.querySelector('.title-name-text:not(.is-outgoing)');
-    if (!current || current.textContent === name) {
-      return;
-    }
-    const incoming = document.createElement('span');
-    incoming.className = 'title-name-text is-entering';
-    incoming.textContent = name;
-    current.classList.add('is-outgoing');
-    titleNameElement.appendChild(incoming);
-    // Force a reflow so the transitions run from the starting state.
-    void incoming.offsetWidth;
-    incoming.classList.remove('is-entering');
-    current.classList.add('is-leaving');
-    current.addEventListener('transitionend', () => current.remove(), {once: true});
-  };
-
-  // Pop the toast with the message Go returned, then auto-dismiss it.
-  const showToast = (message: string) => {
-    if (resultRef.current) {
-      resultRef.current.innerText = message;
-    }
-    if (toastRef.current) {
-      toastRef.current.classList.add('is-visible');
-    }
-    clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => {
-      if (toastRef.current) {
-        toastRef.current.classList.remove('is-visible');
-      }
-    }, 4000);
-  };
-
-  const doGreet = () => {
-    let n = name || 'anonymous';
-    swapTitleName(n);
-    GreetService.Greet(n).then(showToast).catch(console.error);
-  };
-
-  useEffect(() => {
-    Events.On('time', (timeValue: any) => {
-      // On a narrow screen the full RFC1123 stamp is too wide for the footer, so
-      // show just the clock time there (matching the CSS breakpoint).
-      const full = timeValue.data;
-      const compact = (full.match(/\d{1,2}:\d{2}:\d{2}/) || [full])[0];
-      setTime(window.matchMedia('(max-width: 640px)').matches ? compact : full);
-    });
-    // Reload WML so it picks up the wml tags
-    WML.Reload();
   }, []);
 
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
   return (
-    <>
-      <main className="container">
-        <header className="brand">
-          <a className="brand-mark" data-wml-openURL="https://v3.wails.io" aria-label="Wails website">
-            <img src="/wails.png" className="brand-logo" alt="Wails logo"/>
-          </a>
-          <a className="brand-badge" data-wml-openURL="https://reactjs.org" aria-label="React">
-            <img src="/react.svg" alt="React logo"/>
-          </a>
-        </header>
+    <Flex direction="column" gap="4" p="6">
+      <Flex justify="between" align="center">
+        <Heading size="6">设备发现</Heading>
+        <Button onClick={refresh} variant="soft" disabled={loading}>
+          {loading ? '扫描中…' : '刷新'}
+        </Button>
+      </Flex>
 
-        <h1 className="title"><span className="title-accent">Wails +</span> <span className="title-name" ref={titleNameRef}><span className="title-name-text">React</span></span></h1>
-        <p className="subtitle">Build beautiful cross-platform apps with Go and React.</p>
+      {error && (
+        <Callout.Root color="red" size="1">
+          <Callout.Text>扫描失败:{error}</Callout.Text>
+        </Callout.Root>
+      )}
 
-        <div className="greet">
-          <div className="input-box">
-            <svg className="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-            <input aria-label="input" className="input" value={name} onChange={(e) => setName(e.target.value)} type="text" placeholder="Your name" autoComplete="off"/>
-            <button aria-label="greet-btn" className="btn" onClick={doGreet}>Greet
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
-            </button>
-          </div>
-        </div>
-      </main>
+      {!loading && !error && devices.length === 0 && (
+        <Card>
+          <Flex align="center" justify="center" p="5">
+            <Text color="gray" size="2" align="center">
+              未发现 DJI 百望 4G 模组(VID 2C7C)。请确认设备已通过 USB 连接并刷成标准 EC25 PID。
+            </Text>
+          </Flex>
+        </Card>
+      )}
 
-      <hr className="footer-divider"/>
-      <footer className="footer">
-        <span className="footer-version"><span>{wailsVersion}</span></span>
-        <span className="footer-time">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-          <span>{time}</span>
-        </span>
-        <a className="footer-docs" data-wml-openURL="https://v3.wails.io" aria-label="Wails documentation">Docs
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/></svg>
-        </a>
-      </footer>
-
-      <div className="toast" ref={toastRef} role="status" aria-live="polite">
-        <span className="toast-label">From Go</span>
-        <span aria-label="result" className="toast-msg" ref={resultRef}></span>
-      </div>
-    </>
-  )
+      {devices.map((d, i) => (
+        <Card key={`${d.vid}:${d.pid}:${i}`} size="3">
+          <Flex direction="column" gap="3">
+            <Flex justify="between" align="center">
+              <Heading size="4">{d.product || 'DJI 百望 4G 模组'}</Heading>
+              <Badge color="green" variant="soft" size="2">已发现</Badge>
+            </Flex>
+            <Flex direction="column" gap="1">
+              <Row label="VID:PID" value={`${d.vid}:${d.pid}`} />
+              <Row label="厂商" value={d.vendor || '—'} />
+              <Row label="序列号" value={d.serial || '—'} />
+              <Row label="接口数" value={`${d.interfaces}`} />
+            </Flex>
+          </Flex>
+        </Card>
+      ))}
+    </Flex>
+  );
 }
 
-export default App
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <Flex justify="between">
+      <Text as="span" size="2" color="gray">{label}</Text>
+      <Text as="span" size="2" color="gray" highContrast>{value}</Text>
+    </Flex>
+  );
+}
+
+export default App;

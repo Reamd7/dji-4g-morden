@@ -2,7 +2,10 @@ module dji-modem-research/desktop
 
 go 1.26.3
 
-require github.com/wailsapp/wails/v3 v3.0.0-alpha2.117
+require (
+	github.com/google/gousb v1.1.3
+	github.com/wailsapp/wails/v3 v3.0.0-alpha2.117
+)
 
 require (
 	github.com/adrg/xdg v0.5.3 // indirect
