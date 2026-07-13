@@ -8,7 +8,7 @@
 
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore: Unused imports
-import { Call as $Call, CancellablePromise as $CancellablePromise, Create as $Create } from "@wailsio/runtime";
+import { Call as $Call, CancellablePromise as $CancellablePromise } from "@wailsio/runtime";
 
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore: Unused imports
@@ -26,18 +26,14 @@ export function Dial(apn: string): $CancellablePromise<void> {
  * GetConnection 返回拨号后的网络配置(IP/Gateway/DNS/MTU/IPv6)。
  */
 export function GetConnection(): $CancellablePromise<$models.ConnectionInfo | null> {
-    return $Call.ByID(315581859).then(($result: any) => {
-        return $$createType1($result);
-    });
+    return $Call.ByID(315581859);
 }
 
 /**
  * GetStats 返回 relay 流量统计。
  */
 export function GetStats(): $CancellablePromise<$models.RelayStats | null> {
-    return $Call.ByID(4058530830).then(($result: any) => {
-        return $$createType3($result);
-    });
+    return $Call.ByID(4058530830);
 }
 
 /**
@@ -74,9 +70,3 @@ export function StartSOCKS5(addr: string): $CancellablePromise<void> {
 export function StopSOCKS5(): $CancellablePromise<void> {
     return $Call.ByID(849760785);
 }
-
-// Private type creation functions
-const $$createType0 = $models.ConnectionInfo.createFrom;
-const $$createType1 = $Create.Nullable($$createType0);
-const $$createType2 = $models.RelayStats.createFrom;
-const $$createType3 = $Create.Nullable($$createType2);

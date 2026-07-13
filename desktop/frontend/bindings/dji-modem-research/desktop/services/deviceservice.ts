@@ -8,7 +8,7 @@
 
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore: Unused imports
-import { Call as $Call, CancellablePromise as $CancellablePromise, Create as $Create } from "@wailsio/runtime";
+import { Call as $Call, CancellablePromise as $CancellablePromise } from "@wailsio/runtime";
 
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore: Unused imports
@@ -35,9 +35,7 @@ export function Disconnect(): $CancellablePromise<void> {
  * 需先 Connect;每字段一条 AT 命令,整体约 3-5 秒。
  */
 export function GetDeviceInfo(): $CancellablePromise<$models.DeviceInfo | null> {
-    return $Call.ByID(1966400872).then(($result: any) => {
-        return $$createType1($result);
-    });
+    return $Call.ByID(1966400872);
 }
 
 /**
@@ -51,10 +49,8 @@ export function IsConnected(): $CancellablePromise<boolean> {
  * ListDevices 枚举所有 DJI 百望 4G 模组(VID 2C7C),返回描述符信息。
  * 不长期持有设备句柄 — 每次调用独立开闭,供前端刷新设备列表。
  */
-export function ListDevices(): $CancellablePromise<$models.USBDeviceInfo[]> {
-    return $Call.ByID(1184853013).then(($result: any) => {
-        return $$createType3($result);
-    });
+export function ListDevices(): $CancellablePromise<$models.USBDeviceInfo[] | null> {
+    return $Call.ByID(1184853013);
 }
 
 /**
@@ -63,9 +59,3 @@ export function ListDevices(): $CancellablePromise<$models.USBDeviceInfo[]> {
 export function ReportDOM(dom: string): $CancellablePromise<void> {
     return $Call.ByID(566462400, dom);
 }
-
-// Private type creation functions
-const $$createType0 = $models.DeviceInfo.createFrom;
-const $$createType1 = $Create.Nullable($$createType0);
-const $$createType2 = $models.USBDeviceInfo.createFrom;
-const $$createType3 = $Create.Array($$createType2);
