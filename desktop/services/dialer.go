@@ -65,6 +65,10 @@ func (s *DialerService) ServiceStartup(ctx context.Context, opts application.Ser
 // Dial 执行 QMI 拨号:Open MI_04 → SYNC → StartCore → Connect(WDS StartNetwork)。
 // 拿到运营商 IP/DNS/MTU。apn 为空时默认 3gnet。
 func (s *DialerService) Dial(apn string) error {
+	// 预检查:残留 tun-helper 占 MI_04
+	if err := s.checkTUNHelperConflict(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.manager != nil {
@@ -290,7 +294,10 @@ func (s *DialerService) GetStats() (*RelayStats, error) {
 // tun-helper 以 root 独立进程运行(创建 utun + 拨号 + relay + DNS),app 监控其 PID。
 func (s *DialerService) StartTUN(apn string) error {
 	// 先 Hangup SOCKS5 拨号(释放 MI_04,避免 tun-helper claim 冲突)
-	_ = s.Hangup()
+	// 预检查:残留 tun-helper 占 MI_04
+	if err := s.checkTUNHelperConflict(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.tunPID != 0 && s.isTUNProcessAlive() {
@@ -366,4 +373,24 @@ func (s *DialerService) readTUNPIDFile() int {
 	}
 	pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
 	return pid
+}
+
+// checkTUNHelperConflict 检测是否有非本 app 管理的残留 tun-helper 进程(占 MI_04)。
+// 场景:上次 tun-helper 异常退出没清理,或手动启动的。返回错误提示用户先清理。
+func (s *DialerService) checkTUNHelperConflict() error {
+	// 1. 检查 pid 文件(非 app 管理的)
+	if pid := s.readTUNPIDFile(); pid != 0 && pid != s.tunPID {
+		if syscall.Kill(pid, 0) == nil {
+			return fmt.Errorf("检测到残留 tun-helper 进程(PID %d),占着 MI_04。请在 TUN Tab 停止,或手动 sudo kill %d", pid, pid)
+		}
+	}
+	// 2. pgrep 兜底(找所有 tun-helper 进程)
+	out, _ := exec.Command("pgrep", "-f", "tun-helper").Output()
+	for _, p := range strings.Fields(strings.TrimSpace(string(out))) {
+		pid, _ := strconv.Atoi(p)
+		if pid != 0 && pid != s.tunPID && pid != os.Getpid() && syscall.Kill(pid, 0) == nil {
+			return fmt.Errorf("检测到残留 tun-helper 进程(PID %d),占着 MI_04。请手动 sudo kill %d", pid, pid)
+		}
+	}
+	return nil
 }
