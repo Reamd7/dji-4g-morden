@@ -22,6 +22,7 @@ func main() {
 		Services: []application.Service{
 			application.NewService(deviceSvc),
 			application.NewService(&services.SMSService{Device: deviceSvc}),
+			application.NewService(&services.DialerService{}),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),

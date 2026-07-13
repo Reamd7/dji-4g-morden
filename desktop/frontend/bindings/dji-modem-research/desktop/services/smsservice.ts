@@ -8,7 +8,7 @@
 
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore: Unused imports
-import { Call as $Call, CancellablePromise as $CancellablePromise } from "@wailsio/runtime";
+import { Call as $Call, CancellablePromise as $CancellablePromise, Create as $Create } from "@wailsio/runtime";
 
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore: Unused imports
@@ -24,8 +24,10 @@ export function DeleteSMS(index: number): $CancellablePromise<void> {
 /**
  * ListSMS 读取 SIM 已存短信并解码(AT+CMGL=4 → DecodeDeliver,UCS-2/GSM7 自动)。
  */
-export function ListSMS(): $CancellablePromise<$models.SMS[] | null> {
-    return $Call.ByID(3546783768);
+export function ListSMS(): $CancellablePromise<$models.SMS[]> {
+    return $Call.ByID(3546783768).then(($result: any) => {
+        return $$createType1($result);
+    });
 }
 
 /**
@@ -34,3 +36,7 @@ export function ListSMS(): $CancellablePromise<$models.SMS[] | null> {
 export function SendSMS(recipient: string, body: string): $CancellablePromise<void> {
     return $Call.ByID(1292919526, recipient, body);
 }
+
+// Private type creation functions
+const $$createType0 = $models.SMS.createFrom;
+const $$createType1 = $Create.Array($$createType0);
