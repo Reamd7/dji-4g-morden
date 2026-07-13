@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/google/gousb"
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -106,6 +107,17 @@ func (s *DeviceService) Connect() error {
 		_ = transport.Close()
 		return fmt.Errorf("modem 初始化失败: %w", err)
 	}
+
+	// 收信回调:+CMTI 触发时 Emit 事件给前端(实时收信,前端 Events.on("sms:received"))
+	m.SetSMSCallback(func(sender, content string, ts time.Time) {
+		if app := application.Get(); app != nil {
+			app.Event.Emit("sms:received", map[string]any{
+				"sender":    sender,
+				"content":   content,
+				"timestamp": ts.Format("2006-01-02 15:04:05"),
+			})
+		}
+	})
 	s.transport = transport
 	s.modem = m
 	return nil

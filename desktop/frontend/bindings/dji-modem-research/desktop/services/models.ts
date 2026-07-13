@@ -16,6 +16,31 @@ export interface DeviceInfo {
 }
 
 /**
+ * SMS 是一条解码后的短信(前端展示用)。
+ */
+export interface SMS {
+    /**
+     * SIM 存储索引(AT+CMGD 用)
+     */
+    "index": number;
+
+    /**
+     * 发件人 MSISDN
+     */
+    "sender": string;
+
+    /**
+     * 正文(UCS-2/GSM7 自动解码)
+     */
+    "body": string;
+
+    /**
+     * 服务中心时间戳
+     */
+    "timestamp": string;
+}
+
+/**
  * USBDeviceInfo 描述一个发现的 USB 设备,序列化后传给前端。
  */
 export interface USBDeviceInfo {

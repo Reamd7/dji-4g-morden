@@ -15,11 +15,13 @@ import (
 var assets embed.FS
 
 func main() {
+	deviceSvc := &services.DeviceService{}
 	app := application.New(application.Options{
 		Name:        "DJI 4G Desktop",
 		Description: "DJI 4G 模组用户态驱动 — 桌面客户端",
 		Services: []application.Service{
-			application.NewService(&services.DeviceService{}),
+			application.NewService(deviceSvc),
+			application.NewService(&services.SMSService{Device: deviceSvc}),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),
