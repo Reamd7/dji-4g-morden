@@ -93,17 +93,26 @@ import { Events } from "@wailsio/runtime"
 Events.on("sms:received", (e) => setMessages(prev => [...prev, e.data]))
 ```
 
-### Go module 集成:Workspace 方案
+### Go module 集成:独立 module + replace(零影响父项目)
 
-`desktop/` 作为**独立 module**(隔离 Wails 依赖),用 `go.work` 连接上级 `dji-modem-research`,使其能 import `internal/` 包:
+`desktop/` 是**独立 module**(`module dji-modem-research/desktop`,自己的 go.mod),通过 `replace dji-modem-research => ..` 引用父项目。**不用 go.work**——go.work 会让父项目进入 workspace 模式、改变其 module 解析行为,违反"完全不影响现有功能"。
 
+```go
+// desktop/go.mod
+module dji-modem-research/desktop
+
+go 1.26.3
+
+require dji-modem-research v0.0.0
+replace dji-modem-research => ..   // 父目录(同仓库,clone 后路径有效)
 ```
-go.work  (项目根)
-├── .             # dji-modem-research(含 internal/, third_party/, cmd/)
-└── ./desktop     # dji-modem-research/desktop(独立 go.mod,含 wails 依赖)
-```
 
-**好处**:Wails/React 依赖不污染协议栈仓库的 `go.mod`;协议栈改动 desktop 立即可见(workspace 实时链接)。
+**实测验证(2026-07-13)**:
+- ✅ desktop/ 能 `import "dji-modem-research/internal/usbdesc"` 并编译——Go internal 规则基于 import 路径前缀,`dji-modem-research/desktop` 以 `dji-modem-research/` 为前缀,允许访问父 `internal/`
+- ✅ 父项目 `go build ./...` 自动跳过 desktop/(子目录独立 go.mod 形成边界)
+- ✅ 父项目 `go test ./internal/...` 不受影响
+
+**好处**:Wails/React 依赖隔离在 desktop/go.mod,父项目 go.mod 零改动;现有构建/测试/pre-commit hook 全部不受影响。
 
 ## 四、现有 Go 能力 → Services 映射
 
@@ -151,7 +160,6 @@ go.work  (项目根)
 ```
 dji-modem-research/
 ├── go.mod                      # 现有(module dji-modem-research)
-├── go.work                     # 新增:连接 . + ./desktop
 ├── internal/                   # 现有协议栈(被 desktop import)
 ├── third_party/                # 现有
 ├── cmd/                        # 现有 CLI 工具
@@ -213,7 +221,7 @@ UI re-render
 
 | 阶段 | 范围 | 验证标志 |
 |---|---|---|
-| **0. 脚手架** | `go.work` + `desktop/` Wails v3 React 模板 + wails3 CLI 安装 | `wails3 dev` 启动空白窗口,React HMR 工作 |
+| **0. 脚手架** | desktop/ 独立 go.mod(replace => ..)+ Wails v3 React 模板 + wails3 CLI | `wails3 dev` 启动空白窗口,React HMR 工作 |
 | **1. DeviceService** | USB 枚举 + AT 连接 + 信号/设备信息 | GUI 显示 IMEI/ICCID/信号强度 |
 | **2. ModemService** | 短信收发 + `sms:received` 实时事件 | GUI 收发短信(复用 hardware 测试链路) |
 | **3. DialerService** | QMI 拨号 + 连接信息 + 进度事件 | GUI 一键拨号,显示 IPv4/IPv6 |
@@ -237,12 +245,13 @@ wails3 version
 - **macOS**:Xcode Command Line Tools(WebView 系统自带,无额外依赖)
 - **Windows**:WebView2 Runtime(Win10+ 预装;Win7/8 需装)、wintun.dll(TUN 模式,与现有 `cmd/qmidial` 一致)
 
-### Go workspace
+### Go module 集成(已验证)
+
+desktop/ 已有独立 go.mod(`module dji-modem-research/desktop` + `replace dji-modem-research => ..`)。**无需 go.work**——它会影响父项目工具链。已实测:desktop 独立编译 + 父项目 `./...` 自动跳过 desktop/。
 
 ```bash
-# 项目根
-go work init .
-go work use ./desktop
+# desktop/go.mod 已就绪(验证探针建立),wails3 init 时保留此集成方式
+cd desktop && go build ./...   # 独立编译,能 import 父 internal/
 ```
 
 ## 九、风险与注意事项
@@ -264,4 +273,4 @@ Wails v3 + React + TS 是包装现有 Go 协议栈的**最优且可行**路径:
 3. **跨平台**:macOS + Windows 单一代码库,系统 WebView 轻量
 4. **分阶段可验证**:每个阶段对应已跑通的能力,GUI 化即交付
 
-**下一步**:进入阶段 0(脚手架)——安装 wails3 CLI、建 `go.work`、`desktop/` 初始化 React 模板、跑通 `wails3 dev`。
+**下一步**:进入阶段 0(脚手架)——安装 wails3 CLI、desktop/ 用 Wails v3 React 模板初始化(保留已验证的独立 go.mod + replace 集成)、跑通 `wails3 dev`。

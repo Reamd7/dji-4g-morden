@@ -32,3 +32,9 @@ cmd/qmidial/qmidial_done.txt
 
 # Environment file with hardware test secrets (phone numbers, etc.)
 .env
+
+# Desktop client (Wails) build artifacts
+/desktop/desktop
+/desktop/build/bin/
+/desktop/frontend/node_modules/
+/desktop/frontend/dist/
