@@ -341,6 +341,20 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Phase 3: DNS resolution over the 4G link (queries travel
+		// netstack → USB → modem), not the host network.
+		var dnsServers []netip.Addr
+		if d, ok := netip.AddrFromSlice(s.IPv4DNS1); ok {
+			dnsServers = append(dnsServers, d.Unmap())
+		}
+		if d, ok := netip.AddrFromSlice(s.IPv4DNS2); ok {
+			dnsServers = append(dnsServers, d.Unmap())
+		}
+		if len(dnsServers) > 0 {
+			netstackSink.SetDNSServers(dnsServers)
+			fmt.Printf("      netstack DNS via 4G: %v\n", dnsServers)
+		}
+
 		bridge = qmidatapath.New(netstackSink, bulkIn, bulkOut, int(s.MTU), true)
 		if err := bridge.Start(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "Bridge.Start failed: %v\n", err)
@@ -361,9 +375,17 @@ func main() {
 			}
 		}()
 
+		// Baseline relay stats (before any client traffic).
+		baseTx, _, baseRx, _ := bridge.Stats()
+		fmt.Printf("      relay baseline: TX %d pkts, RX %d pkts\n", baseTx, baseRx)
+
 		// Wait for Ctrl+C
 		fmt.Println("\n  Press Ctrl+C to stop...")
 		waitForSignal()
+
+		// Relay delta — DNS queries (Phase 3) + data all traverse USB ↔ netstack.
+		txP, _, rxP, _ := bridge.Stats()
+		fmt.Printf("  Relay delta: TX %+d pkts, RX %+d pkts\n", txP-baseTx, rxP-baseRx)
 
 		// Cleanup socks5
 		socksCancel()

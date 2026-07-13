@@ -40,9 +40,9 @@ WDA SetDataFormat(LinkProtocolIP)后 bulk EP = 裸 IP 包(无以太网头、无 
 - **NetstackPacketSink**:`channel.ReadContext` 支持 ctx 取消(Close 关 channel → 返回 nil → goroutine 自然退出)。`sink.Close() → bridge.Stop() → transport.Close()` 即可,更干净。
 - **`Bridge.Stop()` 带 5s 超时**(`wg.Wait` 包在 `select` 超时里):防 WinUSB 上 `ReadContext` 不响应 ctx 取消导致挂起(2026-07-13 硬件测试 fix,commit `34341de`)。macOS 正常路径不触发超时(SOCKS5 SIGINT 关闭实测 5s 内退出)。
 
-### DNS(Phase 2:host resolver)
+### DNS(Phase 3:经 4G)
 
-`NetstackDialer()` 用 `net.DefaultResolver`(走 host 网络 DNS)解析域名,经 gonet 拨号走 4G。SOCKS5 客户端用 `--socks5-hostname` 把域名透传给 dialer(由我们解析,而非客户端)。Phase 3 待升级为 4G DNS。
+`SetDNSServers(modemDNS)` 后,`NetstackDialer()` 用 `net.Resolver{PreferGo:true, Dial: gonet}` 解析域名——DNS query 经 netstack → USB → modem → 4G 运营商 DNS,而非 host 网络。DNS 协议(压缩指针/CNAME/TCP fallback)委托标准库,只把 transport 换成 gonet,零新依赖。无 DNS 服务器时回退 host resolver(向后兼容)。实测:host reach 不到运营商 DNS(`dig @运营商DNS` 超时),SOCKS5 用该 DNS 解析成功(HTTP 200)——证明 query 必经 4G。
 
 ## 测试
 

@@ -2,9 +2,12 @@ package qmidatapath
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
+	"sync"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -30,6 +33,13 @@ type NetstackPacketSink struct {
 	nicID tcpip.NICID
 	addr  tcpip.Address
 	mtu   uint32
+
+	// DNS servers for resolution over the 4G link (set via SetDNSServers).
+	// When empty, NetstackDialer falls back to the host resolver.
+	dnsServers   []netip.Addr
+	resolverOnce sync.Once
+	resolver     *net.Resolver
+	resolverErr  error
 }
 
 // NewNetstackPacketSink creates a netstack-backed PacketSink.
@@ -163,32 +173,129 @@ func (s *NetstackPacketSink) Close() error {
 	return nil
 }
 
+// SetDNSServers configures DNS servers for resolution over the 4G link.
+// When set, NetstackDialer resolves hostnames via these servers through the
+// netstack (DNS queries travel USB → modem → 4G) instead of the host
+// resolver. Pass modem-assigned DNS (mgr.Settings().IPv4DNS1/DNS2).
+func (s *NetstackPacketSink) SetDNSServers(servers []netip.Addr) {
+	s.dnsServers = append(s.dnsServers[:0:0], servers...)
+	s.resolverOnce = sync.Once{} // invalidate cached resolver
+	s.resolver = nil
+	s.resolverErr = nil
+}
+
+// resolver4G builds (once) a *net.Resolver whose Dial hook routes DNS
+// queries through the gVisor netstack → USB → modem → 4G, targeting the
+// first configured DNS server. DNS protocol handling (compression pointers,
+// CNAME, TCP fallback) is delegated to the standard library.
+func (s *NetstackPacketSink) resolver4G() (*net.Resolver, error) {
+	s.resolverOnce.Do(func() {
+		if len(s.dnsServers) == 0 {
+			s.resolverErr = errors.New("netstack: no DNS servers configured")
+			return
+		}
+		dns := s.dnsServers[0]
+		proto := ipv4.ProtocolNumber
+		if dns.Is6() {
+			proto = ipv6.ProtocolNumber
+		}
+		dnsAddr := tcpip.AddrFromSlice(dns.AsSlice())
+		s.resolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				fullAddr := tcpip.FullAddress{NIC: s.nicID, Addr: dnsAddr, Port: 53}
+				if strings.HasPrefix(network, "tcp") {
+					return gonet.DialContextTCP(ctx, s.stk, fullAddr, proto)
+				}
+				return gonet.DialUDP(s.stk, nil, &fullAddr, proto)
+			},
+		}
+		s.resolverErr = nil
+	})
+	return s.resolver, s.resolverErr
+}
+
+// resolve looks up host's IP addresses. With 4G DNS servers configured, queries
+// go over the netstack → 4G link; otherwise the host resolver is used.
+func (s *NetstackPacketSink) resolve(ctx context.Context, host string) ([]netip.Addr, error) {
+	if len(s.dnsServers) == 0 {
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		return toNetipAddrs(ips), nil
+	}
+	r, err := s.resolver4G()
+	if err != nil {
+		return nil, err
+	}
+	ips, err := r.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	return toNetipAddrs(ips), nil
+}
+
+func toNetipAddrs(ips []net.IPAddr) []netip.Addr {
+	out := make([]netip.Addr, 0, len(ips))
+	for _, ip := range ips {
+		if a, ok := netip.AddrFromSlice(ip.IP); ok {
+			out = append(out, a.Unmap())
+		}
+	}
+	return out
+}
+
+// pickIP selects an IP matching the network's address family (v4/v6).
+// For unspecified families ("tcp"/"udp") the first IP is returned.
+func pickIP(ips []netip.Addr, network string) netip.Addr {
+	if len(ips) == 0 {
+		return netip.Addr{}
+	}
+	switch {
+	case strings.HasSuffix(network, "6"):
+		for _, ip := range ips {
+			if ip.Is6() {
+				return ip
+			}
+		}
+	case strings.HasSuffix(network, "4"):
+		for _, ip := range ips {
+			if ip.Is4() {
+				return ip
+			}
+		}
+	}
+	return ips[0]
+}
+
 // NetstackDialer returns a Dial function suitable for SOCKS5 server's
 // Config.Dial. Connections dialed through this function go through the
 // gVisor netstack → channel → USB → modem (NOT the host network).
 //
-// For Phase 2, DNS resolution uses Go's standard resolver (host network).
-// Phase 3 can upgrade to 4G DNS.
+// DNS resolution (Phase 3): when SetDNSServers has been called, DNS queries
+// are issued over the netstack → 4G link (via a net.Resolver whose Dial hook
+// routes through gonet). With no DNS servers configured, it falls back to
+// the host resolver.
 func (s *NetstackPacketSink) NetstackDialer() func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, fmt.Errorf("netstack dialer: bad addr %q: %w", addr, err)
 		}
-		// DNS resolution via host resolver (Phase 2; upgrade in Phase 3)
-		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
-		if err != nil {
-			return nil, fmt.Errorf("netstack dialer: resolve %q: %w", host, err)
-		}
-		if len(ips) == 0 {
-			return nil, fmt.Errorf("netstack dialer: no IP for %s", host)
-		}
 		portNum, err := net.LookupPort("tcp", port)
 		if err != nil {
 			return nil, fmt.Errorf("netstack dialer: bad port %q: %w", port, err)
 		}
 
-		ipAddr, _ := netip.AddrFromSlice(ips[0])
+		ips, err := s.resolve(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("netstack dialer: resolve %q: %w", host, err)
+		}
+		ipAddr := pickIP(ips, network)
+		if !ipAddr.IsValid() {
+			return nil, fmt.Errorf("netstack dialer: no IP for %s", host)
+		}
 		fullAddr := tcpip.FullAddress{
 			NIC:  s.nicID,
 			Addr: tcpip.AddrFromSlice(ipAddr.AsSlice()),

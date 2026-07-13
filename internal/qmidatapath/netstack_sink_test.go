@@ -129,3 +129,101 @@ func TestNetstackDialerRejectsUnsupported(t *testing.T) {
 		t.Error("expected error for raw socket, got nil")
 	}
 }
+
+// TestSetDNSServers verifies SetDNSServers stores the servers, that
+// resolver4G errors before they are set, and that re-setting invalidates
+// the cached resolver.
+func TestSetDNSServers(t *testing.T) {
+	sink, err := NewNetstackPacketSink(
+		netip.AddrFrom4([4]byte{10, 0, 0, 1}), 1500, false, netip.Addr{},
+	)
+	if err != nil {
+		t.Fatalf("NewNetstackPacketSink: %v", err)
+	}
+	defer sink.Close()
+
+	// No servers yet → resolver4G must error.
+	if _, err := sink.resolver4G(); err == nil {
+		t.Fatal("resolver4G before SetDNSServers: want error, got nil")
+	}
+
+	servers := []netip.Addr{
+		netip.AddrFrom4([4]byte{114, 114, 114, 114}),
+		netip.AddrFrom4([4]byte{8, 8, 8, 8}),
+	}
+	sink.SetDNSServers(servers)
+	if got := len(sink.dnsServers); got != 2 {
+		t.Errorf("dnsServers len = %d, want 2", got)
+	}
+	if sink.dnsServers[0] != servers[0] {
+		t.Errorf("dnsServers[0] = %v, want %v", sink.dnsServers[0], servers[0])
+	}
+
+	// With servers set, resolver4G builds a usable resolver (no query issued).
+	r, err := sink.resolver4G()
+	if err != nil {
+		t.Fatalf("resolver4G after SetDNSServers: %v", err)
+	}
+	if r == nil {
+		t.Fatal("resolver4G returned nil resolver")
+	}
+
+	// Re-setting invalidates the cache (resolverOnce reset) + stores new servers.
+	sink.SetDNSServers([]netip.Addr{netip.AddrFrom4([4]byte{1, 1, 1, 1})})
+	if _, err := sink.resolver4G(); err != nil {
+		t.Fatalf("resolver4G after re-Set: %v", err)
+	}
+	if len(sink.dnsServers) != 1 || sink.dnsServers[0] != netip.AddrFrom4([4]byte{1, 1, 1, 1}) {
+		t.Errorf("dnsServers after re-Set = %v, want [1.1.1.1]", sink.dnsServers)
+	}
+}
+
+// TestResolver4GIPv6Server verifies an IPv6 DNS server constructs the resolver
+// without error (validates the v6 proto branch; no network I/O).
+func TestResolver4GIPv6Server(t *testing.T) {
+	sink, err := NewNetstackPacketSink(
+		netip.AddrFrom4([4]byte{10, 0, 0, 1}), 1500, true,
+		netip.MustParseAddr("2001:db8::1"),
+	)
+	if err != nil {
+		t.Fatalf("NewNetstackPacketSink: %v", err)
+	}
+	defer sink.Close()
+
+	sink.SetDNSServers([]netip.Addr{netip.MustParseAddr("2001:4860:4860::8888")})
+	if _, err := sink.resolver4G(); err != nil {
+		t.Fatalf("resolver4G ipv6 server: %v", err)
+	}
+}
+
+// TestPickIP verifies address-family selection by network suffix.
+func TestPickIP(t *testing.T) {
+	v4 := netip.AddrFrom4([4]byte{1, 2, 3, 4})
+	v6 := netip.MustParseAddr("2001:db8::1")
+	ips := []netip.Addr{v4, v6}
+
+	cases := []struct {
+		network string
+		want    netip.Addr
+	}{
+		{"tcp4", v4},
+		{"tcp6", v6},
+		{"udp4", v4},
+		{"udp6", v6},
+		{"tcp", ips[0]}, // unspecified family → first
+		{"udp", ips[0]},
+	}
+	for _, c := range cases {
+		if got := pickIP(ips, c.network); got != c.want {
+			t.Errorf("pickIP(_, %q) = %v, want %v", c.network, got, c.want)
+		}
+	}
+
+	if got := pickIP(nil, "tcp4"); got.IsValid() {
+		t.Errorf("pickIP(nil) = %v, want invalid", got)
+	}
+	// Requested family absent → falls back to first available.
+	if got := pickIP([]netip.Addr{v4}, "tcp6"); got != v4 {
+		t.Errorf("pickIP([v4], tcp6) = %v, want v4 fallback", got)
+	}
+}
