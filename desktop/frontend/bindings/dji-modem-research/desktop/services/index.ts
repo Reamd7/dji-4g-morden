@@ -7,5 +7,6 @@ export {
 };
 
 export type {
+    DeviceInfo,
     USBDeviceInfo
 } from "./models.js";

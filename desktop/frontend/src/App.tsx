@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Card, Button, Text, Flex, Badge, Heading, Callout } from '@radix-ui/themes';
-import { DeviceService, type USBDeviceInfo } from '../bindings/dji-modem-research/desktop/services';
+import { DeviceService, type USBDeviceInfo, type DeviceInfo } from '../bindings/dji-modem-research/desktop/services';
 
 function App() {
   const [devices, setDevices] = useState<USBDeviceInfo[]>([]);
@@ -8,6 +8,21 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [info, setInfo] = useState<DeviceInfo | null>(null);
+  const [loadingInfo, setLoadingInfo] = useState(false);
+
+  const fetchInfo = useCallback(async () => {
+    setLoadingInfo(true);
+    setError(null);
+    try {
+      const di = await DeviceService.GetDeviceInfo();
+      setInfo(di);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadingInfo(false);
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -19,13 +34,18 @@ function App() {
       ]);
       setDevices(list ?? []);
       setConnected(isConnected);
+      if (isConnected) {
+        fetchInfo();
+      } else {
+        setInfo(null);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setDevices([]);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [fetchInfo]);
 
   const enable = useCallback(async () => {
     setConnecting(true);
@@ -33,18 +53,20 @@ function App() {
     try {
       await DeviceService.Connect();
       setConnected(true);
+      fetchInfo();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setConnecting(false);
     }
-  }, []);
+  }, [fetchInfo]);
 
   const disable = useCallback(async () => {
     setError(null);
     try {
       await DeviceService.Disconnect();
       setConnected(false);
+      setInfo(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -52,7 +74,6 @@ function App() {
 
   useEffect(() => {
     refresh();
-    // 开发期调试:定期把真实 webview DOM 上报后端(写 /tmp/desktop-dom.html)。
     const t = setInterval(() => {
       DeviceService.ReportDOM(document.documentElement.outerHTML).catch(() => {});
     }, 2000);
@@ -93,12 +114,36 @@ function App() {
                 {connected ? '已启用' : '已发现'}
               </Badge>
             </Flex>
+
             <Flex direction="column" gap="1">
               <Row label="VID:PID" value={`${d.vid}:${d.pid}`} />
               <Row label="厂商" value={d.vendor || '—'} />
               <Row label="序列号" value={d.serial || '—'} />
               <Row label="接口数" value={`${d.interfaces}`} />
             </Flex>
+
+            {connected && (
+              <>
+                <Text size="2" color="gray" weight="bold">设备信息</Text>
+                {loadingInfo ? (
+                  <Text size="2" color="gray">查询中…</Text>
+                ) : info ? (
+                  <Flex direction="column" gap="1">
+                    <Row label="IMEI" value={info.imei} />
+                    <Row label="ICCID" value={info.iccid} />
+                    <Row label="IMSI" value={info.imsi} />
+                    <Row label="运营商" value={info.carrier} />
+                    <Row label="本机号" value={info.phone || '—'} />
+                    <Row label="固件" value={info.firmware} />
+                    <Row label="信号" value={info.signalOk ? `${info.signalDbm} dBm` : '无信号'} />
+                  </Flex>
+                ) : null}
+                <Button variant="soft" size="1" onClick={fetchInfo} disabled={loadingInfo}>
+                  刷新信息
+                </Button>
+              </>
+            )}
+
             {connected ? (
               <Button color="red" variant="soft" onClick={disable}>断开设备</Button>
             ) : (

@@ -31,6 +31,14 @@ export function Disconnect(): $CancellablePromise<void> {
 }
 
 /**
+ * GetDeviceInfo 查询已启用设备的详细信息(IMEI/ICCID/IMSI/运营商/本机号/固件/信号 dBm)。
+ * 需先 Connect;每字段一条 AT 命令,整体约 3-5 秒。
+ */
+export function GetDeviceInfo(): $CancellablePromise<$models.DeviceInfo | null> {
+    return $Call.ByID(1966400872);
+}
+
+/**
  * IsConnected 返回设备是否已启用(AT 通道是否打开)。
  */
 export function IsConnected(): $CancellablePromise<boolean> {

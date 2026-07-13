@@ -130,3 +130,39 @@ func (s *DeviceService) IsConnected() bool {
 	defer s.mu.Unlock()
 	return s.modem != nil
 }
+
+// DeviceInfo 是启用后可查询的设备详细信息(每字段对应一条 AT 命令)。
+type DeviceInfo struct {
+	IMEI      string `json:"imei"`
+	ICCID     string `json:"iccid"`
+	IMSI      string `json:"imsi"`
+	Carrier   string `json:"carrier"`
+	Phone     string `json:"phone"`
+	Firmware  string `json:"firmware"`
+	SignalDBm int    `json:"signalDbm"`
+	SignalOk  bool   `json:"signalOk"`
+}
+
+// GetDeviceInfo 查询已启用设备的详细信息(IMEI/ICCID/IMSI/运营商/本机号/固件/信号 dBm)。
+// 需先 Connect;每字段一条 AT 命令,整体约 3-5 秒。
+func (s *DeviceService) GetDeviceInfo() (*DeviceInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.modem == nil {
+		return nil, fmt.Errorf("设备未启用,请先启用")
+	}
+	ctx := context.Background()
+	imsi, _ := s.modem.IMSI(ctx)
+	fw, _ := s.modem.SoftwareVersion(ctx)
+	rssi, ok := s.modem.SignalDBm(ctx)
+	return &DeviceInfo{
+		IMEI:      s.modem.IMEI(ctx),
+		ICCID:     s.modem.ICCID(ctx),
+		IMSI:      imsi,
+		Carrier:   s.modem.Carrier(ctx),
+		Phone:     s.modem.PhoneNumber(ctx),
+		Firmware:  fw,
+		SignalDBm: rssi,
+		SignalOk:  ok,
+	}, nil
+}
