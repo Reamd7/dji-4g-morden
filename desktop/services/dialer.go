@@ -289,6 +289,8 @@ func (s *DialerService) GetStats() (*RelayStats, error) {
 // StartTUN 启动 TUN 模式:先 build tun-helper binary,再 osascript sudo 启动(弹密码框)。
 // tun-helper 以 root 独立进程运行(创建 utun + 拨号 + relay + DNS),app 监控其 PID。
 func (s *DialerService) StartTUN(apn string) error {
+	// 先 Hangup SOCKS5 拨号(释放 MI_04,避免 tun-helper claim 冲突)
+	_ = s.Hangup()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.tunPID != 0 && s.isTUNProcessAlive() {
