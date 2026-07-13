@@ -1,0 +1,25 @@
+{
+  "name": "component-kit",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "DJI 4G Desktop 组件展示库 (Storybook)",
+  "scripts": {
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@storybook/react": "^10.0.0",
+    "@storybook/react-vite": "^10.0.0",
+    "@types/react": "^18.2.43",
+    "@types/react-dom": "^18.2.17",
+    "@vitejs/plugin-react": "^4.3.4",
+    "storybook": "^10.0.0",
+    "typescript": "^5.2.2",
+    "vite": "^5.4.0"
+  }
+}
