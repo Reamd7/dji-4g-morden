@@ -247,9 +247,9 @@ qmi2: 10.147.0.3/27  (Modem #3)     ← route table 冲突 + source binding
 
 ```
 # 独立端口模式:每个模块一个 SOCKS5
-Modem #1 (<运营商>) → netstack → SOCKS5 :1081
-Modem #2 (移动) → netstack → SOCKS5 :1082
-Modem #3 (电信) → netstack → SOCKS5 :1083
+Modem #1 (运营商 A) → netstack → SOCKS5 :1081
+Modem #2 (运营商 B) → netstack → SOCKS5 :1082
+Modem #3 (运营商 C) → netstack → SOCKS5 :1083
 
 # 负载均衡模式:所有模块共用一个 SOCKS5
 ┌─ netstack #1 ─┐
