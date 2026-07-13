@@ -100,7 +100,9 @@ func main() {
 		fatal("Bridge.Start", err)
 	}
 
-	// 6. DNS (networksetup on macOS — netcfg.UpdateDNS is broken)
+	// 6. DNS:设全局(Wi-Fi service)+ utun + flush cache。
+	// 断 WiFi 后系统 DNS resolver 仍读 Wi-Fi service 的 DNS config(持久),
+	// DNS query 到 4G DNS → 命中 0/1 route → utun → 4G。
 	st := mgr.Settings()
 	if st != nil && len(st.IPv4DNS1) > 0 {
 		dns1 := st.IPv4DNS1.String()
@@ -128,6 +130,7 @@ func main() {
 	<-sigCh
 
 	// Cleanup
+	restoreDNS()
 	bridge.Stop()
 	tunDev.Close()
 	mgr.Stop()
@@ -142,8 +145,29 @@ func fatal(msg string, err error) {
 	os.Exit(1)
 }
 
+// configureDNS 设 utun + Wi-Fi(全局)DNS + flush cache。
+// Wi-Fi DNS 即使断 WiFi(inactive),config 仍保留,系统 resolver 仍读。
 func configureDNS(ifname, dns1, dns2 string) {
-	if runtime.GOOS == "darwin" {
-		_ = exec.Command("networksetup", "-setdnsservers", ifname, dns1, dns2).Run()
+	if runtime.GOOS != "darwin" {
+		return
 	}
+	// utun 接口 DNS
+	_ = exec.Command("networksetup", "-setdnsservers", ifname, dns1, dns2).Run()
+	// Wi-Fi service DNS(全局,断 WiFi 后仍保留 config)
+	_ = exec.Command("networksetup", "-setdnsservers", "Wi-Fi", dns1, dns2).Run()
+	// flush DNS cache(强制 resolver 用新 DNS)
+	_ = exec.Command("dscacheutil", "-flushcache").Run()
+	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
+	fmt.Printf("DNS configured: %s %s (utun + Wi-Fi)\n", dns1, dns2)
+}
+
+// restoreDNS 还原 Wi-Fi DNS(clear = DHCP 自动)+ flush。
+func restoreDNS() {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	_ = exec.Command("networksetup", "-setdnsservers", "Wi-Fi", "empty").Run()
+	_ = exec.Command("dscacheutil", "-flushcache").Run()
+	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
+	fmt.Println("DNS restored to DHCP.")
 }
