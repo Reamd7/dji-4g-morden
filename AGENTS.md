@@ -441,3 +441,43 @@ dji-modem-research/
 
 - **`sms-gateway/modem/`**(AGPL-3.0):AT 协议"壳"。核心改动:`port serial.Port` → `io.ReadWriteCloser` + `NewFromIO`(transport 注入);`readLine` USB 适配(`>` 提示符 + 逐字节读,方向F);`pdu.go` facade 化(委托 smscodec);补 11 条 AT 命令(network/sim/config 新文件);`SetSMSCallback` +CMTI 实时收信管道。保留 ICMP ping / zerolog / Open 串口路径。
 - **`quectel-qmi-go/`**(license 待确认):QMI 协议栈 + manager。复制 `qmi/`(协议栈)+ `manager/`(全功能连接管理器,~13K 行)+ `device/`(Linux 设备发现)+ `netcfg/`(三平台网络配置)。`transport_export.go` 导出 `NewClientFromTransport` 注入 USB transport;`usb_entry.go` 导出 `NewWithClient` 注入预构造 client(hook 绕过 /dev/cdc-wdm0 + Linux sysfs)。阶段 2 拨号验证通过(IPv4+IPv6 双栈),阶段 3 TUN relay 端到端上网验证通过(curl+DNS+ping)。
+
+### 探索性记录:macOS 断 WiFi 后 TUN DNS 问题(2026-07-14,待解决)
+
+**问题**:desktop TUN 模式(utun 虚拟网卡)在断 WiFi 后,DNS 解析完全失败(curl "Could not resolve host"),但 IP 直连 + dig @4G DNS 均成功。
+
+**全链路测试结果**:
+
+| 测试项 | 结果 | 说明 |
+|---|---|---|
+| `curl http://124.237.177.164`(IP 直连) | ✅ 百度 301 | TUN relay(utun → USB → modem → 4G)正常 |
+| `dig @<4G_DNS_1> www.baidu.com` | ✅ 解析出 IP | 4G DNS 经 utun(0/1 route)→ 4G → 响应正常 |
+| `dig @114.114.114.114 www.baidu.com` | ✅ 解析出 IP | 同上 |
+| `curl http://www.baidu.com`(DNS 解析) | ❌ Could not resolve host | macOS 系统 DNS resolver 失败 |
+| `networksetup -setdnsservers "Wi-Fi" <4G_DNS_1>` | ❌ resolver #1 仍无 nameserver | Wi-Fi inactive → configd 不合并 DNS |
+| `scutil set State:/Network/Global/DNS` | ❌ resolver #1 仍无 nameserver | configd 不合并 Global DNS 到 resolver #1 |
+| `/etc/resolver/default`(127.0.0.1) | resolver #8 Reachable 但被 #1 遮蔽 | mDNSResponder 只查 resolver #1,不 fallback |
+| tun-helper DNS proxy(127.0.0.1:53 → 4G DNS) | proxy 正常但 resolver 不路由到它 | 同上遮蔽问题 |
+
+**根因**:
+1. macOS 断 WiFi(关闭 radio)后,Wi-Fi service inactive → configd 清除 `resolver #1`(全局默认)的 nameserver
+2. `resolver #1` 是 mDNSResponder 的**首选** default resolver,即使无 nameserver 也不 fallback 到 `/etc/resolver/default`(resolver #8)
+3. 用户态 TUN(wireguard/tun 创建 utun)**不是 configd 管理的 network service**,configd 不自动为其配置 DNS
+4. 所有 workaround(networksetup Global DNS / /etc/resolver / scutil State)都无法让 resolver #1 获得 nameserver
+5. IP 直连和 dig(指定 @server)正常,因为它们绕过系统 resolver(直接 UDP 到 4G DNS server via utun route)
+
+**环境因素**:
+- 用户有 EasyTier(utun6,100.100.100.101,DNS domain=et.net)和 11 个 utun 接口,但它们不干扰 resolver #1(只影响各自 domain)
+- 用户有 Clash(端口 7890)—— 不影响 DNS resolver(configd 层面)
+- macOS 15.6.1 Sequoia
+
+**结论**:这是 macOS 系统级限制。用户态 TUN(wireguard/tun 包)创建的 utun 无法让 configd 管理 DNS。需要 **macOS NetworkExtension/SystemExtension**(像 Tailscale/Clash for Windows/Surge 那样),才能让 configd 正确管理虚拟接口的 DNS + 在系统层出现原生网卡。
+
+**已尝试的方案(均无效)**:
+- `networksetup -setdnsservers "Wi-Fi" 127.0.0.1`(Wi-Fi inactive 不合并)
+- `scutil set State:/Network/Global/DNS`(configd 不合并到 resolver #1)
+- `/etc/resolver/default`(resolver #8 Reachable 但被 #1 遮蔽)
+- 本地 DNS proxy 127.0.0.1:53(DNS proxy 正常但 resolver 不路由)
+- `curl --resolve`(绕系统 resolver,有效但不通用:浏览器/Clash 等不能用)
+
+**下一步**:调研 macOS NetworkExtension/SystemExtension 的 DNS 管理方案(Go 实现可行性 + Swift bridge)。
