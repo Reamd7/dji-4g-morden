@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Card, Button, Text, Flex, TextField, Heading, Badge, Callout } from '@radix-ui/themes';
+import { Card, Button, Text, Flex, TextField, Heading, Badge, Callout, Tabs, Separator } from '@radix-ui/themes';
 import { DialerService, type ConnectionInfo, type RelayStats } from '../../bindings/dji-modem-research/desktop/services';
 
 function NetworkPage() {
@@ -16,12 +16,14 @@ function NetworkPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const [isConn, isSocks] = await Promise.all([
+      const [isConn, isSocks, isTun] = await Promise.all([
         DialerService.IsConnected(),
         DialerService.IsSOCKS5Running(),
+        DialerService.IsTUNRunning(),
       ]);
       setConnected(isConn);
       setSocksRunning(isSocks);
+      setTunRunning(isTun);
       if (isConn) {
         setConn(await DialerService.GetConnection());
       } else {
@@ -33,7 +35,7 @@ function NetworkPage() {
         setStats(null);
       }
     } catch {
-      // 静默(services 未就绪时)
+      // 静默
     }
   }, []);
 
@@ -124,93 +126,119 @@ function NetworkPage() {
         </Callout.Root>
       )}
 
-      <Card size="3">
-        <Flex direction="column" gap="3">
-          <Flex justify="between" align="center">
-            <Heading size="4">QMI 拨号</Heading>
-            <Badge color={connected ? 'green' : 'gray'} variant="soft">
-              {connected ? '已拨号' : '未拨号'}
-            </Badge>
-          </Flex>
-          {!connected && (
-            <TextField.Root placeholder="APN(默认 3gnet)" value={apn} onChange={(e) => setApn(e.target.value)} />
-          )}
-          {connected ? (
-            <Button color="red" variant="soft" onClick={hangup}>断开</Button>
-          ) : (
-            <Button onClick={dial} disabled={connecting}>
-              {connecting ? '拨号中…(约 30s)' : '拨号'}
-            </Button>
-          )}
-        </Flex>
-      </Card>
+      <Tabs.Root defaultValue="socks5">
+        <Tabs.List>
+          <Tabs.Trigger value="socks5">SOCKS5 代理</Tabs.Trigger>
+          <Tabs.Trigger value="tun">TUN 系统代理</Tabs.Trigger>
+        </Tabs.List>
 
-      {connected && conn && (
-        <Card size="3">
-          <Flex direction="column" gap="2">
-            <Heading size="4">连接信息</Heading>
-            <Row label="IPv4" value={conn.ipv4Address} />
-            <Row label="网关" value={conn.gateway} />
-            <Row label="DNS" value={`${conn.dns1}${conn.dns2 ? ', ' + conn.dns2 : ''}`} />
-            <Row label="MTU" value={`${conn.mtu}`} />
-            {conn.ipv6Address && <Row label="IPv6" value={conn.ipv6Address} />}
-          </Flex>
-        </Card>
-      )}
-
-      {connected && (
-        <Card size="3">
+        {/* ── SOCKS5 模式:拨号 → SOCKS5 ── */}
+        <Tabs.Content value="socks5">
           <Flex direction="column" gap="3">
-            <Flex justify="between" align="center">
-              <Heading size="4">SOCKS5 代理</Heading>
-              <Badge color={socksRunning ? 'green' : 'gray'} variant="soft">
-                {socksRunning ? '运行中' : '未启动'}
-              </Badge>
-            </Flex>
-            {socksRunning ? (
-              <Flex direction="column" gap="1">
-                <Text size="2" color="gray">监听地址:<Text as="span" color="iris" highContrast>{socksAddr}</Text></Text>
-                <Text size="1" color="gray">curl --socks5-hostname {socksAddr} http://www.baidu.com</Text>
-              </Flex>
-            ) : (
-              <TextField.Root placeholder="监听地址" value={socksAddr} onChange={(e) => setSocksAddr(e.target.value)} />
-            )}
-            {socksRunning ? (
-              <Button color="red" variant="soft" onClick={stopSocks}>停止</Button>
-            ) : (
-              <Button onClick={startSocks}>启动 SOCKS5(无需 admin)</Button>
-            )}
-            {socksRunning && stats && (
-              <Flex gap="4">
-                <Text size="2" color="gray">↑ {stats.txPackets} 包 / {stats.txBytes} B</Text>
-                <Text size="2" color="gray">↓ {stats.rxPackets} 包 / {stats.rxBytes} B</Text>
-              </Flex>
-            )}
-          </Flex>
-        </Card>
-      )}
+            <Callout.Root color="blue" size="1">
+              <Callout.Text>SOCKS5 模式:需先拨号,再启动 SOCKS5。应用需手动配代理(curl/Clash)。无需管理员密码。</Callout.Text>
+            </Callout.Root>
 
-      <Card size="3">
-        <Flex direction="column" gap="3">
-          <Flex justify="between" align="center">
-            <Heading size="4">TUN 模式(系统级)</Heading>
-            <Badge color={tunRunning ? 'green' : 'gray'} variant="soft">
-              {tunRunning ? '运行中' : '未启动'}
-            </Badge>
+            <Card size="3">
+              <Flex direction="column" gap="3">
+                <Flex justify="between" align="center">
+                  <Heading size="4">第 1 步:拨号</Heading>
+                  <Badge color={connected ? 'green' : 'gray'} variant="soft">
+                    {connected ? '已拨号' : '未拨号'}
+                  </Badge>
+                </Flex>
+                {!connected && (
+                  <TextField.Root placeholder="APN(默认 3gnet)" value={apn} onChange={(e) => setApn(e.target.value)} />
+                )}
+                {connected ? (
+                  <Button color="red" variant="soft" onClick={hangup}>断开</Button>
+                ) : (
+                  <Button onClick={dial} disabled={connecting}>
+                    {connecting ? '拨号中…(约 30s)' : '拨号'}
+                  </Button>
+                )}
+              </Flex>
+            </Card>
+
+            {connected && conn && (
+              <Card size="2">
+                <Flex direction="column" gap="2">
+                  <Row label="IPv4" value={conn.ipv4Address} />
+                  <Row label="网关" value={conn.gateway} />
+                  <Row label="DNS" value={`${conn.dns1}${conn.dns2 ? ', ' + conn.dns2 : ''}`} />
+                  <Row label="MTU" value={`${conn.mtu}`} />
+                  {conn.ipv6Address && <Row label="IPv6" value={conn.ipv6Address} />}
+                </Flex>
+              </Card>
+            )}
+
+            <Card size="3">
+              <Flex direction="column" gap="3">
+                <Flex justify="between" align="center">
+                  <Heading size="4">第 2 步:SOCKS5 代理</Heading>
+                  <Badge color={socksRunning ? 'green' : 'gray'} variant="soft">
+                    {socksRunning ? '运行中' : '未启动'}
+                  </Badge>
+                </Flex>
+                {socksRunning ? (
+                  <Flex direction="column" gap="1">
+                    <Text size="2" color="gray">监听:<Text as="span" color="iris" highContrast>{socksAddr}</Text></Text>
+                    <Text size="1" color="gray">curl --socks5-hostname {socksAddr} http://www.baidu.com</Text>
+                  </Flex>
+                ) : (
+                  <TextField.Root placeholder="监听地址" value={socksAddr} onChange={(e) => setSocksAddr(e.target.value)} />
+                )}
+                {socksRunning ? (
+                  <Button color="red" variant="soft" onClick={stopSocks}>停止</Button>
+                ) : (
+                  <Button onClick={startSocks} disabled={!connected}>启动 SOCKS5</Button>
+                )}
+                {socksRunning && stats && (
+                  <Flex gap="4">
+                    <Text size="2" color="gray">↑ {stats.txPackets} 包 / {stats.txBytes} B</Text>
+                    <Text size="2" color="gray">↓ {stats.rxPackets} 包 / {stats.rxBytes} B</Text>
+                  </Flex>
+                )}
+              </Flex>
+            </Card>
           </Flex>
-          <Text size="2" color="gray">
-            创建系统虚拟网卡,所有流量自动走 4G(无需单独配代理)。<Text color="amber">需管理员密码</Text>。
-          </Text>
-          <Text size="1" color="gray">断 WiFi 时也能上网(TUN 独立于主机网络)</Text>
-          {tunRunning ? (
-            <Button color="red" variant="soft" onClick={stopTUN}>停止 TUN</Button>
-          ) : (
-            <Button onClick={startTUN} disabled={tunStarting}>
-              {tunStarting ? '启动中…(输入密码 + 拨号约 30s)' : '启动 TUN(弹密码框)'}
-            </Button>
-          )}
-        </Flex>
-      </Card>
+        </Tabs.Content>
+
+        {/* ── TUN 模式:一键(自带拨号)── */}
+        <Tabs.Content value="tun">
+          <Flex direction="column" gap="3">
+            <Callout.Root color="amber" size="1">
+              <Callout.Text>
+                TUN 模式:创建系统虚拟网卡,所有流量自动走 4G(无需单独配代理)。
+                <strong>自带拨号</strong>(会自动断开 SOCKS5),<strong>需管理员密码</strong>。断 WiFi 也能上网。
+              </Callout.Text>
+            </Callout.Root>
+
+            <Card size="3">
+              <Flex direction="column" gap="3">
+                <Flex justify="between" align="center">
+                  <Heading size="4">TUN 系统代理</Heading>
+                  <Badge color={tunRunning ? 'green' : 'gray'} variant="soft">
+                    {tunRunning ? '运行中' : '未启动'}
+                  </Badge>
+                </Flex>
+                {!tunRunning && (
+                  <TextField.Root placeholder="APN(默认 3gnet)" value={apn} onChange={(e) => setApn(e.target.value)} />
+                )}
+                {tunRunning ? (
+                  <Button color="red" variant="soft" onClick={stopTUN}>停止 TUN</Button>
+                ) : (
+                  <Button onClick={startTUN} disabled={tunStarting}>
+                    {tunStarting ? '启动中…(密码 + 拨号约 30s)' : '启动 TUN'}
+                  </Button>
+                )}
+                <Separator size="4" />
+                <Text size="2" color="gray">启动后系统所有流量自动经 utun → 4G。测试:curl http://www.baidu.com(无需 --socks5)</Text>
+              </Flex>
+            </Card>
+          </Flex>
+        </Tabs.Content>
+      </Tabs.Root>
     </Flex>
   );
 }
