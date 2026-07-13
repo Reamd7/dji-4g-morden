@@ -6,13 +6,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"runtime"
 	"syscall"
 	"time"
-
 	"golang.zx2c4.com/wireguard/tun"
 
 	"dji-modem-research/internal/qmidatapath"
@@ -100,17 +100,15 @@ func main() {
 		fatal("Bridge.Start", err)
 	}
 
-	// 6. DNS:设全局(Wi-Fi service)+ utun + flush cache。
-	// 断 WiFi 后系统 DNS resolver 仍读 Wi-Fi service 的 DNS config(持久),
-	// DNS query 到 4G DNS → 命中 0/1 route → utun → 4G。
+	// 6. DNS:启动本地 DNS proxy(127.0.0.1:53 → 4G DNS via utun11),
+	// 设系统 DNS = 127.0.0.1(lo0 永远 Reachable,绕过 configd Not Reachable)。
 	st := mgr.Settings()
 	if st != nil && len(st.IPv4DNS1) > 0 {
 		dns1 := st.IPv4DNS1.String()
-		dns2 := ""
-		if len(st.IPv4DNS2) > 0 {
-			dns2 = st.IPv4DNS2.String()
-		}
-		configureDNS(tunName, dns1, dns2)
+		// 本地 DNS proxy:转发到 4G DNS(经 utun11)
+		go runDNSProxy(ctx, dns1)
+		// 设系统 DNS = 127.0.0.1 + flush
+		configureDNS(tunName, dns1, "")
 	}
 
 	ipStr := ""
@@ -145,29 +143,75 @@ func fatal(msg string, err error) {
 	os.Exit(1)
 }
 
-// configureDNS 设 utun + Wi-Fi(全局)DNS + flush cache。
-// Wi-Fi DNS 即使断 WiFi(inactive),config 仍保留,系统 resolver 仍读。
+// configureDNS 设系统 DNS = 127.0.0.1(本地 proxy)+ /etc/resolver/default + flush。
 func configureDNS(ifname, dns1, dns2 string) {
 	if runtime.GOOS != "darwin" {
 		return
 	}
-	// utun 接口 DNS
-	_ = exec.Command("networksetup", "-setdnsservers", ifname, dns1, dns2).Run()
-	// Wi-Fi service DNS(全局,断 WiFi 后仍保留 config)
-	_ = exec.Command("networksetup", "-setdnsservers", "Wi-Fi", dns1, dns2).Run()
-	// flush DNS cache(强制 resolver 用新 DNS)
+	// 系统 DNS = 127.0.0.1(lo0 永远 Reachable,绕过 configd 的 Wi-Fi Not Reachable)
+	_ = exec.Command("networksetup", "-setdnsservers", "Wi-Fi", "127.0.0.1").Run()
+	// /etc/resolver/default 作为 fallback
+	_ = os.MkdirAll("/etc/resolver", 0755)
+	_ = os.WriteFile("/etc/resolver/default", []byte("nameserver 127.0.0.1\n"), 0644)
+	// flush
 	_ = exec.Command("dscacheutil", "-flushcache").Run()
 	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
-	fmt.Printf("DNS configured: %s %s (utun + Wi-Fi)\n", dns1, dns2)
+	fmt.Printf("DNS proxy on 127.0.0.1:53 → %s, system DNS = 127.0.0.1\n", dns1)
 }
 
-// restoreDNS 还原 Wi-Fi DNS(clear = DHCP 自动)+ flush。
+// restoreDNS 还原:删 /etc/resolver/default + 清 Wi-Fi DNS + flush。
 func restoreDNS() {
 	if runtime.GOOS != "darwin" {
 		return
 	}
+	_ = os.Remove("/etc/resolver/default")
 	_ = exec.Command("networksetup", "-setdnsservers", "Wi-Fi", "empty").Run()
 	_ = exec.Command("dscacheutil", "-flushcache").Run()
 	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
-	fmt.Println("DNS restored to DHCP.")
+	fmt.Println("DNS restored.")
+}
+
+// runDNSProxy 监听 127.0.0.1:53,转发 UDP DNS query 到 upstream(4G DNS)。
+// upstream 的 DNS query 经 utun11(0/1 route)→ USB → modem → 4G。
+func runDNSProxy(ctx context.Context, upstream string) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IP{127, 0, 0, 1}, Port: 53})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "DNS proxy: listen 127.0.0.1:53: %v\n", err)
+		return
+	}
+	defer conn.Close()
+	fmt.Printf("DNS proxy listening on 127.0.0.1:53 → %s\n", upstream)
+
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
+	buf := make([]byte, 1500)
+	for {
+		n, client, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		query := make([]byte, n)
+		copy(query, buf[:n])
+
+		go func(q []byte, c *net.UDPAddr) {
+			uc, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.ParseIP(upstream), Port: 53})
+			if err != nil {
+				return
+			}
+			defer uc.Close()
+			uc.SetDeadline(time.Now().Add(5 * time.Second))
+			if _, err := uc.Write(q); err != nil {
+				return
+			}
+			resp := make([]byte, 1500)
+			rn, err := uc.Read(resp)
+			if err != nil {
+				return
+			}
+			conn.WriteToUDP(resp[:rn], c)
+		}(query, client)
+	}
 }
