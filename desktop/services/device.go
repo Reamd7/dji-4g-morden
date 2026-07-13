@@ -5,6 +5,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/google/gousb"
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -28,6 +29,12 @@ type DeviceService struct{}
 
 func (s *DeviceService) ServiceStartup(ctx context.Context, opts application.ServiceOptions) error {
 	return nil
+}
+
+// ReportDOM 接收前端上报的 DOM 快照(开发期调试自动化:写 /tmp 供外部检查)。
+// 前端定期调用此方法,把真实 webview 的 DOM(含 wails runtime 渲染结果)写到文件。
+func (s *DeviceService) ReportDOM(dom string) {
+	_ = os.WriteFile("/tmp/desktop-dom.html", []byte(dom), 0644)
 }
 
 // ListDevices 枚举所有 DJI 百望 4G 模组(VID 2C7C),返回描述符信息。

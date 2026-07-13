@@ -24,6 +24,14 @@ function App() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+  useEffect(() => {
+    // 开发期调试:定期把真实 webview DOM 上报后端(写 /tmp/desktop-dom.html),
+    // 供自动化检查(wails webview 无 CDP,只能前端主动上报)。
+    const t = setInterval(() => {
+      DeviceService.ReportDOM(document.documentElement.outerHTML).catch(() => {});
+    }, 2000);
+    return () => clearInterval(t);
+  }, []);
 
   return (
     <Flex direction="column" gap="4" p="6">

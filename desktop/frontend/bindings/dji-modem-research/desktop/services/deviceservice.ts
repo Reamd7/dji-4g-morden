@@ -21,3 +21,11 @@ import * as $models from "./models.js";
 export function ListDevices(): $CancellablePromise<$models.USBDeviceInfo[] | null> {
     return $Call.ByID(1184853013);
 }
+
+/**
+ * ReportDOM 接收前端上报的 DOM 快照(开发期调试自动化:写 /tmp 供外部检查)。
+ * 前端定期调用此方法,把真实 webview 的 DOM(含 wails runtime 渲染结果)写到文件。
+ */
+export function ReportDOM(dom: string): $CancellablePromise<void> {
+    return $Call.ByID(566462400, dom);
+}
