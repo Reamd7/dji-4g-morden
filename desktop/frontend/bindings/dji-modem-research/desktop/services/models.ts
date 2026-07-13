@@ -31,7 +31,7 @@ export interface USBDeviceInfo {
     "serial": string;
 
     /**
-     * 接口数(EC25 模式通常 5:MI_00..MI_04)
+     * 接口数(EC25 模式通常 5)
      */
     "interfaces": number;
 }

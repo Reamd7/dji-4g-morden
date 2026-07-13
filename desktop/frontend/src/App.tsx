@@ -6,13 +6,19 @@ function App() {
   const [devices, setDevices] = useState<USBDeviceInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [connected, setConnected] = useState(false);
+  const [connecting, setConnecting] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const list = await DeviceService.ListDevices();
+      const [list, isConnected] = await Promise.all([
+        DeviceService.ListDevices(),
+        DeviceService.IsConnected(),
+      ]);
       setDevices(list ?? []);
+      setConnected(isConnected);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setDevices([]);
@@ -21,17 +27,37 @@ function App() {
     }
   }, []);
 
+  const enable = useCallback(async () => {
+    setConnecting(true);
+    setError(null);
+    try {
+      await DeviceService.Connect();
+      setConnected(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setConnecting(false);
+    }
+  }, []);
+
+  const disable = useCallback(async () => {
+    setError(null);
+    try {
+      await DeviceService.Disconnect();
+      setConnected(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
   useEffect(() => {
     refresh();
-  }, [refresh]);
-  useEffect(() => {
-    // 开发期调试:定期把真实 webview DOM 上报后端(写 /tmp/desktop-dom.html),
-    // 供自动化检查(wails webview 无 CDP,只能前端主动上报)。
+    // 开发期调试:定期把真实 webview DOM 上报后端(写 /tmp/desktop-dom.html)。
     const t = setInterval(() => {
       DeviceService.ReportDOM(document.documentElement.outerHTML).catch(() => {});
     }, 2000);
     return () => clearInterval(t);
-  }, []);
+  }, [refresh]);
 
   return (
     <Flex direction="column" gap="4" p="6">
@@ -44,7 +70,7 @@ function App() {
 
       {error && (
         <Callout.Root color="red" size="1">
-          <Callout.Text>扫描失败:{error}</Callout.Text>
+          <Callout.Text>操作失败:{error}</Callout.Text>
         </Callout.Root>
       )}
 
@@ -63,7 +89,9 @@ function App() {
           <Flex direction="column" gap="3">
             <Flex justify="between" align="center">
               <Heading size="4">{d.product || 'DJI 百望 4G 模组'}</Heading>
-              <Badge color="green" variant="soft" size="2">已发现</Badge>
+              <Badge color={connected ? 'green' : 'amber'} variant="soft" size="2">
+                {connected ? '已启用' : '已发现'}
+              </Badge>
             </Flex>
             <Flex direction="column" gap="1">
               <Row label="VID:PID" value={`${d.vid}:${d.pid}`} />
@@ -71,6 +99,13 @@ function App() {
               <Row label="序列号" value={d.serial || '—'} />
               <Row label="接口数" value={`${d.interfaces}`} />
             </Flex>
+            {connected ? (
+              <Button color="red" variant="soft" onClick={disable}>断开设备</Button>
+            ) : (
+              <Button onClick={enable} disabled={connecting}>
+                {connecting ? '启用中…' : '启用设备'}
+              </Button>
+            )}
           </Flex>
         </Card>
       ))}
