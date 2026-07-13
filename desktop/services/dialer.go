@@ -359,7 +359,7 @@ func (s *DialerService) findResidualTUNKillCmd() string {
 	var pids []string
 	for _, p := range strings.Fields(strings.TrimSpace(string(out))) {
 		pid, _ := strconv.Atoi(p)
-		if pid != 0 && pid != os.Getpid() && syscall.Kill(pid, 0) == nil {
+		if pid != 0 && pid != os.Getpid() && processAlive(pid) {
 			pids = append(pids, p)
 		}
 	}
@@ -375,11 +375,11 @@ func (s *DialerService) IsTUNRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// 1. app 管理的 PID
-	if s.tunPID != 0 && syscall.Kill(s.tunPID, 0) == nil {
+	if s.tunPID != 0 && processAlive(s.tunPID) {
 		return true
 	}
 	// 2. pid 文件兜底(tun-helper 自己写的)
-	if pid := s.readTUNPIDFile(); pid != 0 && syscall.Kill(pid, 0) == nil {
+	if pid := s.readTUNPIDFile(); pid != 0 && processAlive(pid) {
 		s.tunPID = pid // 恢复追踪
 		return true
 	}
@@ -394,7 +394,14 @@ func (s *DialerService) isTUNProcessAlive() bool {
 	if s.tunPID == 0 {
 		return false
 	}
-	return syscall.Kill(s.tunPID, 0) == nil
+	return processAlive(s.tunPID)
+}
+
+// processAlive 检查进程是否存活。kill -0 对 root 进程返回 EPERM(非 root 无权限),
+// 但 EPERM 意味着进程存在。nil 或 EPERM 都算存活;ESRCH 才是真正不存在。
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
 }
 
 func (s *DialerService) readTUNPIDFile() int {
@@ -411,7 +418,7 @@ func (s *DialerService) readTUNPIDFile() int {
 func (s *DialerService) checkTUNHelperConflict() error {
 	// 1. 检查 pid 文件(非 app 管理的)
 	if pid := s.readTUNPIDFile(); pid != 0 && pid != s.tunPID {
-		if syscall.Kill(pid, 0) == nil {
+		if processAlive(pid) {
 			return fmt.Errorf("检测到残留 tun-helper 进程(PID %d),占着 MI_04。请在 TUN Tab 停止,或手动 sudo kill %d", pid, pid)
 		}
 	}
@@ -419,7 +426,7 @@ func (s *DialerService) checkTUNHelperConflict() error {
 	out, _ := exec.Command("pgrep", "-f", "tun-helper").Output()
 	for _, p := range strings.Fields(strings.TrimSpace(string(out))) {
 		pid, _ := strconv.Atoi(p)
-		if pid != 0 && pid != s.tunPID && pid != os.Getpid() && syscall.Kill(pid, 0) == nil {
+		if pid != 0 && pid != s.tunPID && pid != os.Getpid() && processAlive(pid) {
 			return fmt.Errorf("检测到残留 tun-helper 进程(PID %d),占着 MI_04。请手动 sudo kill %d", pid, pid)
 		}
 	}
