@@ -293,21 +293,15 @@ func (s *DialerService) GetStats() (*RelayStats, error) {
 // StartTUN 启动 TUN 模式:先 build tun-helper binary,再 osascript sudo 启动(弹密码框)。
 // tun-helper 以 root 独立进程运行(创建 utun + 拨号 + relay + DNS),app 监控其 PID。
 func (s *DialerService) StartTUN(apn string) error {
-	// 先 Hangup SOCKS5 拨号(释放 MI_04,避免 tun-helper claim 冲突)
-	// 预检查:残留 tun-helper 占 MI_04
-	if err := s.checkTUNHelperConflict(); err != nil {
-		return err
-	}
+	// 先 Hangup SOCKS5 拨号(释放 MI_04)
+	_ = s.Hangup()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.tunPID != 0 && s.isTUNProcessAlive() {
-		return fmt.Errorf("TUN 已运行(PID %d)", s.tunPID)
-	}
 	if apn == "" {
 		apn = "3gnet"
 	}
 
-	// 1. Build tun-helper(非 root,go build)
+	// 1. Build tun-helper
 	helperPath := filepath.Join(os.TempDir(), "dji-tun-helper")
 	cwd, _ := os.Getwd()
 	build := exec.Command("go", "build", "-o", helperPath, "./cmd/tun-helper")
@@ -316,10 +310,13 @@ func (s *DialerService) StartTUN(apn string) error {
 		return fmt.Errorf("build tun-helper: %w\n%s", err, out)
 	}
 
-	// 2. osascript sudo 启动(弹 macOS 密码框提权)
+	// 2. 找残留 tun-helper,合并到 osascript(kill 残留 + 启动新,一次密码)
+	killPart := s.findResidualTUNKillCmd()
+	_ = os.Remove("/tmp/tun-helper.pid")
+	_ = os.Remove("/tmp/tun-helper.status")
 	script := fmt.Sprintf(
-		`do shell script "%s -apn %s > /tmp/tun-helper.log 2>&1 & echo $!" with administrator privileges`,
-		helperPath, apn,
+		`do shell script "%s%s -apn %s > /tmp/tun-helper.log 2>&1 & echo $!" with administrator privileges`,
+		killPart, helperPath, apn,
 	)
 	out, err := exec.Command("osascript", "-e", script).Output()
 	if err != nil {
@@ -330,7 +327,6 @@ func (s *DialerService) StartTUN(apn string) error {
 	pidStr := strings.TrimSpace(string(out))
 	pid, _ := strconv.Atoi(pidStr)
 	if pid == 0 {
-		// fallback: 从 pid 文件读
 		time.Sleep(2 * time.Second)
 		pid = s.readTUNPIDFile()
 	}
@@ -338,19 +334,41 @@ func (s *DialerService) StartTUN(apn string) error {
 	return nil
 }
 
-// StopTUN 停止 TUN(osascript sudo kill root 进程)。
+// StopTUN 停止 TUN(pgrep 兜底找所有 tun-helper,osascript sudo kill)。
 func (s *DialerService) StopTUN() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.tunPID == 0 {
-		return nil
+	// pgrep 找所有 tun-helper(不只 s.tunPID,兜底清理孤儿)
+	killCmd := s.findResidualTUNKillCmd()
+	if killCmd == "" && s.tunPID != 0 {
+		killCmd = fmt.Sprintf("kill %d; ", s.tunPID)
 	}
-	script := fmt.Sprintf(`do shell script "kill %d" with administrator privileges`, s.tunPID)
-	_, _ = exec.Command("osascript", "-e", script).Output()
+	if killCmd != "" {
+		script := fmt.Sprintf(`do shell script "%s" with administrator privileges`, killCmd)
+		_, _ = exec.Command("osascript", "-e", script).Output()
+	}
 	s.tunPID = 0
 	_ = os.Remove("/tmp/tun-helper.pid")
+	_ = os.Remove("/tmp/tun-helper.status")
 	return nil
 }
+
+// findResidualTUNKillCmd 用 pgrep 找所有存活 tun-helper,返回 "kill PID1 PID2; " 或 ""。
+func (s *DialerService) findResidualTUNKillCmd() string {
+	out, _ := exec.Command("pgrep", "-f", "tun-helper").Output()
+	var pids []string
+	for _, p := range strings.Fields(strings.TrimSpace(string(out))) {
+		pid, _ := strconv.Atoi(p)
+		if pid != 0 && pid != os.Getpid() && syscall.Kill(pid, 0) == nil {
+			pids = append(pids, p)
+		}
+	}
+	if len(pids) == 0 {
+		return ""
+	}
+	return "kill " + strings.Join(pids, " ") + "; sleep 1; "
+}
+
 
 // IsTUNRunning 返回 TUN helper 是否在运行。
 func (s *DialerService) IsTUNRunning() bool {
