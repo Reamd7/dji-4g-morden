@@ -140,6 +140,8 @@ Windows:SOCKS5 同样验证通过(硬件测试驱动 3 个 bug 修复,见 commit
 
 **DNS Phase 3(经 4G,2026-07-13 macOS 验证)**:`SetDNSServers(modemDNS)` + `net.Resolver{PreferGo:true, Dial: gonet}`,DNS query 经 netstack → USB → 4G 运营商 DNS,协议解析委托标准库(零新依赖)。实测:`dig @运营商DNS` 经 host 超时(host reach 不到),但 SOCKS5 用该 DNS 解析 baidu/taobao HTTP 200,relay delta TX/RX +128/+126 pkts——证明 DNS query 必经 4G。
 
+**Stage 4 收尾(2026-07-13)**:UDP transport 已实现(armon/go-socks5 `ASSOCIATE` + netstack `gonet.DialUDP`),端到端实测受限于 SOCKS5 UDP 客户端工具稀缺,标记为"已实现,待客户端验证"。micro-batching(USB write 合并,可选性能优化)留作 future。`plans/stage4*` 已归档至 `plans/archive/stage4/`。**Stage 4 正式收官。**
+
 **相关文档**:
 - `docs/performance/01-qcusbwwan-reverse-engineering.md` — 官方驱动逆向 + 设计思想
 - `docs/performance/02-tun-alternatives.md` — TUN 替代方案 + 多设备场景
@@ -418,13 +420,7 @@ dji-modem-research/
 ├── issue/
 │   └── 001-gousb-close-transfer-cancel-crash.md
 ├── plans/
-│   ├── stage2-qmi-dialup.md   # 阶段 2 总览
-│   ├── stage2/                # 阶段 2 子计划 00-08
-│   ├── stage3-tun-internet.md # 阶段 3 总览
-│   ├── stage3/                # 阶段 3 子计划 00-04
-│   ├── stage4-dual-backend.md # 阶段 4 总览(TUN + netstack 双后端)
-│   ├── stage4/                # 阶段 4 子计划 00-04
-│   └── archive/
+│   └── archive/                # 已归档:stage2/3/4 总览 + 子计划
 ├── references/     # osmocom/sixfab/linux-driver/wintun-0.14.1.zip
 └── docs/           # 研究文档(01-03 方案/硬件/源码,04-10 AT 命令)
 ```
