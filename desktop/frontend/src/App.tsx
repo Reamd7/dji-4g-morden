@@ -15,7 +15,9 @@ function App() {
   }, []);
 
   return (
-    <Tabs.Root defaultValue="device">
+    <>
+      <div className="window-drag" />
+      <Tabs.Root defaultValue="device">
       <Tabs.List>
         <Tabs.Trigger value="device">设备</Tabs.Trigger>
         <Tabs.Trigger value="sms">短信</Tabs.Trigger>
@@ -31,6 +33,7 @@ function App() {
         <NetworkPage />
       </Tabs.Content>
     </Tabs.Root>
+    </>
   );
 }
 
