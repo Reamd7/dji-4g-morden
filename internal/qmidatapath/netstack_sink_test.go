@@ -7,6 +7,10 @@ import (
 	"net/netip"
 	"testing"
 	"time"
+
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 )
 
 // TestNetstackSinkCreateClose verifies NetstackPacketSink can be created and closed.
@@ -225,5 +229,40 @@ func TestPickIP(t *testing.T) {
 	// Requested family absent → falls back to first available.
 	if got := pickIP([]netip.Addr{v4}, "tcp6"); got != v4 {
 		t.Errorf("pickIP([v4], tcp6) = %v, want v4 fallback", got)
+	}
+}
+
+// TestNetstackSinkUpRoundTrip verifies the uplink path: netstack emits a
+// packet (TCP SYN from a dial attempt) → channel → ReadPacket reads it out.
+func TestNetstackSinkUpRoundTrip(t *testing.T) {
+	sink, err := NewNetstackPacketSink(
+		netip.AddrFrom4([4]byte{10, 0, 0, 1}), 1500, false, netip.Addr{},
+	)
+	if err != nil {
+		t.Fatalf("NewNetstackPacketSink: %v", err)
+	}
+	defer sink.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Trigger an outbound packet: a TCP connect sends a SYN through netstack.
+	go func() {
+		gonet.DialContextTCP(ctx, sink.stk, tcpip.FullAddress{
+			NIC:  sink.nicID,
+			Addr: tcpip.AddrFrom4([4]byte{93, 184, 216, 34}),
+			Port: 80,
+		}, ipv4.ProtocolNumber)
+	}()
+
+	pkt, err := sink.ReadPacket(ctx)
+	if err != nil {
+		t.Fatalf("ReadPacket: %v", err)
+	}
+	if len(pkt) == 0 {
+		t.Fatal("ReadPacket got empty packet")
+	}
+	if pkt[0]>>4 != 4 {
+		t.Fatalf("ReadPacket got non-IPv4 packet (first byte %02x)", pkt[0])
 	}
 }

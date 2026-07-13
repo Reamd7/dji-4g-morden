@@ -60,6 +60,9 @@ type Bridge struct {
 	bulkOut BulkWriter
 	mtu     int
 	zlp     bool // append ZLP after 512-multiple TX packets
+	microBatch bool          // coalesce uplink writes (default off; experimental)
+	batchSize  int           // max packets per coalesced write
+	batchDelay time.Duration // max wait before flushing a partial batch
 
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
@@ -90,6 +93,18 @@ func New(sink PacketSink, bulkIn BulkReader, bulkOut BulkWriter, mtu int, zlp bo
 	}
 }
 
+// SetMicroBatching enables uplink micro-batching: accumulate up to size
+// packets (or delay) into a single bulk OUT write to reduce USB write
+// frequency. Experimental — modem compatibility with coalesced raw-IP writes
+// is unverified (raw-IP packets carry their own length, so the modem should
+// split on IP boundaries, but not hardware-tested). Leave off unless
+// benchmarked. Must be called before Start.
+func (b *Bridge) SetMicroBatching(size int, delay time.Duration) {
+	b.microBatch = size > 0
+	b.batchSize = size
+	b.batchDelay = delay
+}
+
 // Start launches the two relay goroutines (sink→modem, modem→sink).
 // Idempotent — calling twice is a no-op.
 func (b *Bridge) Start(parent context.Context) error {
@@ -114,11 +129,12 @@ func (b *Bridge) Start(parent context.Context) error {
 // Does NOT close the sink — the caller owns sink lifecycle.
 // Safe to call after Start; safe to call multiple times.
 //
-// NOTE: For TUN-backed sinks, the caller MUST close the TUN before calling
-// Stop (or simultaneously), because TUNPacketSink.ReadPacket blocks on
-// tun.Read which doesn't respect context cancellation. Closing the TUN
-// unblocks the read, allowing the goroutine to exit so Stop's wg.Wait()
-// can return. Netstack-backed sinks don't have this issue (channel close
+// NOTE: For TUN-backed sinks, the caller MUST close the sink before calling
+// Stop (or simultaneously), because TUNPacketSink.ReadPacket issues a read
+// that does not honor context cancellation. Closing the sink unblocks the
+// read so the goroutine exits and Stop's wg.Wait() returns. Netstack-backed
+// sinks don't deadlock here (channel close → ReadContext returns nil), but
+// sink.Close() before Stop is still the recommended order.
 func (b *Bridge) Stop() {
 	b.mu.Lock()
 	if !b.started {
@@ -153,6 +169,10 @@ func (b *Bridge) Stop() {
 // maxPacketSize (512 bytes).
 func (b *Bridge) sinkToModem(ctx context.Context) {
 	defer b.wg.Done()
+	if b.microBatch {
+		b.sinkToModemBatch(ctx)
+		return
+	}
 
 	for {
 		select {
@@ -187,6 +207,77 @@ func (b *Bridge) sinkToModem(ctx context.Context) {
 		// write (Zero Length Packet) to signal end-of-transfer.
 		if b.zlp && len(pkt)%bulkMaxPacketSize == 0 {
 			b.bulkOut.Write([]byte{})
+		}
+	}
+}
+
+// sinkToModemBatch coalesces uplink packets into fewer bulk OUT writes. A
+// reader goroutine feeds ReadPacket results into a channel; the main loop
+// accumulates until batchSize packets or batchDelay elapses, then issues a
+// single Write. ZLP (if enabled) is appended when the coalesced buffer
+// length is a multiple of 512.
+func (b *Bridge) sinkToModemBatch(ctx context.Context) {
+	pkts := make(chan []byte, b.batchSize)
+	go func() {
+		for {
+			pkt, err := b.sink.ReadPacket(ctx)
+			if err != nil {
+				return
+			}
+			select {
+			case pkts <- pkt:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	buf := make([]byte, 0, b.batchSize*1500)
+	count := 0
+	timer := time.NewTimer(b.batchDelay)
+	defer timer.Stop()
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		if _, err := b.bulkOut.Write(buf); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("qmidatapath: bulk OUT batch write error: %v", err)
+			}
+		} else if b.zlp && len(buf)%bulkMaxPacketSize == 0 {
+			b.bulkOut.Write([]byte{})
+		}
+		buf = buf[:0]
+		count = 0
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case pkt := <-pkts:
+			if len(pkt) == 0 {
+				continue
+			}
+			buf = append(buf, pkt...)
+			b.txPackets.Add(1)
+			b.txBytes.Add(int64(len(pkt)))
+			count++
+			if count >= b.batchSize {
+				flush()
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(b.batchDelay)
+			}
+		case <-timer.C:
+			flush()
+			timer.Reset(b.batchDelay)
 		}
 	}
 }

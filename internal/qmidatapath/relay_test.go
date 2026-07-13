@@ -517,3 +517,89 @@ func makeIPv4Packet(totalLen int) []byte {
 	pkt[9] = 1  // ICMP
 	return pkt
 }
+
+// TestBridgeMicroBatchCoalesces verifies micro-batching coalesces multiple
+// uplink packets into a single bulk OUT write when batchSize is reached.
+func TestBridgeMicroBatchCoalesces(t *testing.T) {
+	sink := newFakePacketSink()
+	defer sink.Close()
+	w := &fakeBulkWriter{}
+	br := newFakeBulkReader()
+
+	b := New(sink, br, w, 1500, false)
+	b.SetMicroBatching(3, 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := b.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Stop()
+
+	for i := range 3 {
+		sink.rx <- []byte{0x45, 0x00, 0x00, 0x14, byte(i)}
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	got := w.packets()
+	if len(got) != 1 {
+		t.Fatalf("micro-batch: want 1 coalesced write, got %d", len(got))
+	}
+	if len(got[0]) != 15 {
+		t.Fatalf("coalesced write len = %d, want 15", len(got[0]))
+	}
+}
+
+// TestBridgeMicroBatchTimeoutFlush verifies a partial batch flushes on timeout.
+func TestBridgeMicroBatchTimeoutFlush(t *testing.T) {
+	sink := newFakePacketSink()
+	defer sink.Close()
+	w := &fakeBulkWriter{}
+	br := newFakeBulkReader()
+
+	b := New(sink, br, w, 1500, false)
+	b.SetMicroBatching(16, 30*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := b.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Stop()
+
+	sink.rx <- []byte{0x45, 0x00, 0x00, 0x14}
+	time.Sleep(80 * time.Millisecond)
+
+	got := w.packets()
+	if len(got) != 1 {
+		t.Fatalf("timeout flush: want 1 write, got %d", len(got))
+	}
+	if len(got[0]) != 4 {
+		t.Fatalf("flushed write len = %d, want 4", len(got[0]))
+	}
+}
+
+// TestBridgeMicroBatchOffDefaultsSingle verifies that without SetMicroBatching,
+// each packet is written individually (default behavior preserved).
+func TestBridgeMicroBatchOffDefaultsSingle(t *testing.T) {
+	sink := newFakePacketSink()
+	defer sink.Close()
+	w := &fakeBulkWriter{}
+	br := newFakeBulkReader()
+
+	b := New(sink, br, w, 1500, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := b.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer b.Stop()
+
+	for i := range 3 {
+		sink.rx <- []byte{0x45, 0x00, 0x00, 0x14, byte(i)}
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	got := w.packets()
+	if len(got) != 3 {
+		t.Fatalf("default (no micro-batch): want 3 writes, got %d", len(got))
+	}
+}

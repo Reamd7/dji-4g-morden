@@ -49,6 +49,7 @@ func openFullStack(t *testing.T, apn string) (*qmitransport.QMITransport, *qmi.C
 	cfg := manager.Config{
 		APN:        apn,
 		EnableIPv4: true,
+		EnableIPv6: true,
 		Device:     manager.ModemDevice{NetInterface: "dummy"}, // triggers WDA
 		Timeouts: manager.TimeoutConfig{
 			IndicationRegister: 15 * time.Second,
