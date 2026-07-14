@@ -102,7 +102,9 @@ func main() {
 		fatal("Bridge.Start", err)
 	}
 
-	// 6. DNS:scutil 注入 synthetic service(Tailscale 方式)
+	// 6. DNS + IPv4 + IPv6:scutil 注入完整 synthetic service。
+	// 关键:仅设 DNS 会被标记 Supplemental(非 primary)。
+	// 必须同时设 IPv4 + IPv6 state,configd 才把 synthetic service 当 primary(ZeroTier 验证)。
 	st := mgr.Settings()
 	if st != nil && len(st.IPv4DNS1) > 0 {
 		dns1 := st.IPv4DNS1.String()
@@ -110,7 +112,11 @@ func main() {
 		if len(st.IPv4DNS2) > 0 {
 			dns2 = st.IPv4DNS2.String()
 		}
-		configureDNS(tunName, dns1, dns2)
+		ip4 := ""
+		if len(st.IPv4Address) > 0 {
+			ip4 = st.IPv4Address.String()
+		}
+		configureSyntheticService(tunName, ip4, dns1, dns2)
 	}
 
 	ipStr := ""
@@ -145,50 +151,79 @@ func fatal(msg string, err error) {
 	os.Exit(1)
 }
 
-// configureDNS 用 Tailscale 的 scutil 方式注入 synthetic SCDynamicStore service。
-// State:/Network/Service/<UUID>/DNS + SearchOrder 100000 + SupplementalMatchDomains ""
-// 让 configd 创建独立 resolver(不依赖 Wi-Fi active,断 WiFi 也 Reachable)。
-// 纯 exec.Command("scutil"),不需 CGo/networksetup/127.0.0.1 proxy。
-func configureDNS(ifname, dns1, dns2 string) {
+const syntheticServiceKey = "State:/Network/Service/FF457792-79C0-4A25-8392-D875BBEACCA6"
+
+// configureSyntheticService 注入完整 synthetic network service(DNS + IPv4 + IPv6)。
+// 仅 DNS 会被标记 Supplemental;必须同时设 IPv4 + IPv6 state,configd 才当 primary(ZeroTier 验证)。
+func configureSyntheticService(ifname, ip4, dns1, dns2 string) {
 	if runtime.GOOS != "darwin" {
 		return
 	}
-	var script strings.Builder
-	script.WriteString("d.init\n")
-	script.WriteString("d.add SearchOrder # 100000\n")
-	script.WriteString("d.add ServerAddresses *")
-	script.WriteString(" " + dns1)
-	if dns2 != "" {
-		script.WriteString(" " + dns2)
-	}
-	script.WriteString("\n")
-	script.WriteString("d.add SupplementalMatchDomains * \"\"\n")
-	script.WriteString("set State:/Network/Service/FF457792-79C0-4A25-8392-D875BBEACCA6/DNS\n")
-	script.WriteString("quit\n")
 
-	cmd := exec.Command("/usr/sbin/scutil")
-	cmd.Stdin = strings.NewReader(script.String())
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("DNS scutil error: %v: %s\n", err, strings.TrimSpace(string(out)))
-	} else {
-		fmt.Printf("DNS configured via scutil (Tailscale method): %s %s\n", dns1, dns2)
+	// 1. DNS
+	var dnsScript strings.Builder
+	dnsScript.WriteString("d.init\n")
+	dnsScript.WriteString("d.add SearchOrder # 100000\n")
+	dnsScript.WriteString("d.add ServerAddresses * " + dns1)
+	if dns2 != "" {
+		dnsScript.WriteString(" " + dns2)
 	}
+	dnsScript.WriteString("\n")
+	dnsScript.WriteString("d.add SupplementalMatchDomains * \"\"\n")
+	dnsScript.WriteString("set " + syntheticServiceKey + "/DNS\n")
+	dnsScript.WriteString("quit\n")
+	runScutil(dnsScript.String())
+
+	// 2. IPv4(ZeroTier: Router 用 127.0.0.1,不用真实 gateway)
+	if ip4 != "" {
+		var v4Script strings.Builder
+		v4Script.WriteString("d.init\n")
+		v4Script.WriteString("d.add Addresses * " + ip4 + "\n")
+		v4Script.WriteString("d.add InterfaceName " + ifname + "\n")
+		v4Script.WriteString("d.add ServerAddress 127.0.0.1\n")
+		v4Script.WriteString("d.add Router 127.0.0.1\n")
+		v4Script.WriteString("set " + syntheticServiceKey + "/IPv4\n")
+		v4Script.WriteString("quit\n")
+		runScutil(v4Script.String())
+	}
+
+	// 3. IPv6(link-local,让 macOS 认为接口有 IPv6 连通性)
+	var v6Script strings.Builder
+	v6Script.WriteString("d.init\n")
+	v6Script.WriteString("d.add Addresses * fe80::dji4g\n")
+	v6Script.WriteString("d.add DestAddresses * ::ffff:ffff:ffff:ffff:0:0\n")
+	v6Script.WriteString("d.add Flags 0\n")
+	v6Script.WriteString("d.add InterfaceName " + ifname + "\n")
+	v6Script.WriteString("d.add PrefixLength * 64\n")
+	v6Script.WriteString("set " + syntheticServiceKey + "/IPv6\n")
+	v6Script.WriteString("quit\n")
+	runScutil(v6Script.String())
+
 	_ = exec.Command("dscacheutil", "-flushcache").Run()
 	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
+	fmt.Printf("Synthetic service configured: DNS=%s, IPv4=%s, IPv6=fe80::dji4g\n", dns1, ip4)
 }
 
-// restoreDNS 还原:scutil remove synthetic service key + flush。
+// restoreDNS 还原:删除 synthetic service 的所有 key + flush。
 func restoreDNS() {
 	if runtime.GOOS != "darwin" {
 		return
 	}
-	cmd := exec.Command("/usr/sbin/scutil")
-	cmd.Stdin = strings.NewReader("remove State:/Network/Service/FF457792-79C0-4A25-8392-D875BBEACCA6/DNS\nquit\n")
-	_, _ = cmd.CombinedOutput()
+	for _, suffix := range []string{"/DNS", "/IPv4", "/IPv6"} {
+		runScutil("remove " + syntheticServiceKey + suffix + "\nquit\n")
+	}
 	_ = exec.Command("dscacheutil", "-flushcache").Run()
 	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
-	fmt.Println("DNS restored.")
+	fmt.Println("Synthetic service removed.")
+}
+
+func runScutil(script string) {
+	cmd := exec.Command("/usr/sbin/scutil")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("scutil error: %v: %s\n", err, strings.TrimSpace(string(out)))
+	}
 }
 
 // runDNSProxy 监听 127.0.0.1:53,转发 UDP DNS query 到 upstream(4G DNS)。
