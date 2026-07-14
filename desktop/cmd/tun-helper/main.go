@@ -11,8 +11,10 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
+
 	"golang.zx2c4.com/wireguard/tun"
 
 	"dji-modem-research/internal/qmidatapath"
@@ -100,15 +102,15 @@ func main() {
 		fatal("Bridge.Start", err)
 	}
 
-	// 6. DNS:启动本地 DNS proxy(127.0.0.1:53 → 4G DNS via utun11),
-	// 设系统 DNS = 127.0.0.1(lo0 永远 Reachable,绕过 configd Not Reachable)。
+	// 6. DNS:scutil 注入 synthetic service(Tailscale 方式)
 	st := mgr.Settings()
 	if st != nil && len(st.IPv4DNS1) > 0 {
 		dns1 := st.IPv4DNS1.String()
-		// 本地 DNS proxy:转发到 4G DNS(经 utun11)
-		go runDNSProxy(ctx, dns1)
-		// 设系统 DNS = 127.0.0.1 + flush
-		configureDNS(tunName, dns1, "")
+		dns2 := ""
+		if len(st.IPv4DNS2) > 0 {
+			dns2 = st.IPv4DNS2.String()
+		}
+		configureDNS(tunName, dns1, dns2)
 	}
 
 	ipStr := ""
@@ -143,29 +145,47 @@ func fatal(msg string, err error) {
 	os.Exit(1)
 }
 
-// configureDNS 设系统 DNS = 127.0.0.1(本地 proxy)+ /etc/resolver/default + flush。
+// configureDNS 用 Tailscale 的 scutil 方式注入 synthetic SCDynamicStore service。
+// State:/Network/Service/<UUID>/DNS + SearchOrder 100000 + SupplementalMatchDomains ""
+// 让 configd 创建独立 resolver(不依赖 Wi-Fi active,断 WiFi 也 Reachable)。
+// 纯 exec.Command("scutil"),不需 CGo/networksetup/127.0.0.1 proxy。
 func configureDNS(ifname, dns1, dns2 string) {
 	if runtime.GOOS != "darwin" {
 		return
 	}
-	// 系统 DNS = 127.0.0.1(lo0 永远 Reachable,绕过 configd 的 Wi-Fi Not Reachable)
-	_ = exec.Command("networksetup", "-setdnsservers", "Wi-Fi", "127.0.0.1").Run()
-	// /etc/resolver/default 作为 fallback
-	_ = os.MkdirAll("/etc/resolver", 0755)
-	_ = os.WriteFile("/etc/resolver/default", []byte("nameserver 127.0.0.1\n"), 0644)
-	// flush
+	var script strings.Builder
+	script.WriteString("d.init\n")
+	script.WriteString("d.add SearchOrder # 100000\n")
+	script.WriteString("d.add ServerAddresses *")
+	script.WriteString(" " + dns1)
+	if dns2 != "" {
+		script.WriteString(" " + dns2)
+	}
+	script.WriteString("\n")
+	script.WriteString("d.add SupplementalMatchDomains * \"\"\n")
+	script.WriteString("set State:/Network/Service/FF457792-79C0-4A25-8392-D875BBEACCA6/DNS\n")
+	script.WriteString("quit\n")
+
+	cmd := exec.Command("/usr/sbin/scutil")
+	cmd.Stdin = strings.NewReader(script.String())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("DNS scutil error: %v: %s\n", err, strings.TrimSpace(string(out)))
+	} else {
+		fmt.Printf("DNS configured via scutil (Tailscale method): %s %s\n", dns1, dns2)
+	}
 	_ = exec.Command("dscacheutil", "-flushcache").Run()
 	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
-	fmt.Printf("DNS proxy on 127.0.0.1:53 → %s, system DNS = 127.0.0.1\n", dns1)
 }
 
-// restoreDNS 还原:删 /etc/resolver/default + 清 Wi-Fi DNS + flush。
+// restoreDNS 还原:scutil remove synthetic service key + flush。
 func restoreDNS() {
 	if runtime.GOOS != "darwin" {
 		return
 	}
-	_ = os.Remove("/etc/resolver/default")
-	_ = exec.Command("networksetup", "-setdnsservers", "Wi-Fi", "empty").Run()
+	cmd := exec.Command("/usr/sbin/scutil")
+	cmd.Stdin = strings.NewReader("remove State:/Network/Service/FF457792-79C0-4A25-8392-D875BBEACCA6/DNS\nquit\n")
+	_, _ = cmd.CombinedOutput()
 	_ = exec.Command("dscacheutil", "-flushcache").Run()
 	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
 	fmt.Println("DNS restored.")
